@@ -1,0 +1,16 @@
+* text=auto
+
+*.cpp text
+*.h text
+*.ps1 text
+*.py text
+*.js text
+*.html text
+*.css text
+*.md text
+*.ini text
+*.txt text
+
+*.png binary
+*.bit binary
+*.res binary

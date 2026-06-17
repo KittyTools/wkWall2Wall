@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wkWall2Wall Wall Editor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="logo">W2W</div>
+        <div>
+          <h1>wkWall2Wall Editor</h1>
+          <p>Draw rectangles around Wall-X-Wall touch targets.</p>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>1. Load map</h2>
+        <label class="file-button">
+          <input id="mapInput" type="file" accept="image/png,image/jpeg,image/bmp,image/gif,image/webp">
+          Choose map image
+        </label>
+        <label class="file-button secondary">
+          <input id="iniInput" type="file" accept=".ini,.w2w.ini,text/plain">
+          Import existing .w2w.ini
+        </label>
+        <div id="mapInfo" class="muted">No map loaded.</div>
+      </section>
+
+      <section class="panel controls">
+        <h2>2. Draw walls</h2>
+        <div class="mode-switch" role="group" aria-label="Editor mode">
+          <button id="drawModeButton" type="button" class="active" aria-pressed="true" title="Draw wall rectangles">Draw</button>
+          <button id="panModeButton" type="button" aria-pressed="false" title="Move around the map. Hold Space to use Pan temporarily.">Pan</button>
+        </div>
+        <div class="button-grid">
+          <button id="zoomOutButton" type="button">Zoom -</button>
+          <button id="zoomInButton" type="button">Zoom +</button>
+          <button id="fitButton" type="button">Fit</button>
+          <button id="oneToOneButton" type="button">100%</button>
+          <button id="undoButton" type="button" title="Undo the last editor change">Undo change</button>
+          <button id="redoButton" type="button" title="Redo the last undone change">Redo change</button>
+          <button id="deleteButton" type="button" title="Delete the selected wall rectangle">Delete selected</button>
+          <button id="clearButton" type="button" class="danger">Clear all</button>
+        </div>
+      </section>
+
+      <section class="panel inspector">
+        <h2>Selected wall</h2>
+        <div id="emptyInspector" class="muted">No wall selected.</div>
+        <div id="wallInspector" class="hidden">
+          <label>Name <input id="wallName" type="text"></label>
+          <label>X <input id="wallX" type="number" min="0" step="1"></label>
+          <label>Y <input id="wallY" type="number" min="0" step="1"></label>
+          <label>W <input id="wallW" type="number" min="1" step="1"></label>
+          <label>H <input id="wallH" type="number" min="1" step="1"></label>
+          <label>Color <input id="wallColor" type="color" value="#00ff00"></label>
+        </div>
+      </section>
+
+      <section class="panel walls-panel">
+        <h2>Walls <span id="wallCount">0</span></h2>
+        <ol id="wallList" class="wall-list"></ol>
+      </section>
+
+      <section class="panel export-panel">
+        <h2>3. Export</h2>
+        <button id="exportButton" type="button" class="primary">Download .w2w.ini</button>
+        <div id="status" class="status">Ready.</div>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <div id="canvasWrap" class="canvas-wrap">
+        <canvas id="mapCanvas" width="1280" height="720"></canvas>
+        <div id="emptyState" class="empty-state">
+          <strong>Load a map image to start.</strong>
+          <span>No command line or Python required.</span>
+        </div>
+      </div>
+      <footer class="workspace-footer">
+        <span id="cursorInfo">x: -, y: -</span>
+        <span id="modeInfo">mode: Draw - hold Space for Pan</span>
+        <span id="zoomInfo">zoom: 100%</span>
+      </footer>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
