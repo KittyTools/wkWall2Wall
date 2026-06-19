@@ -51,11 +51,12 @@ constexpr std::uintptr_t kWaWormDataScanBytes = 0x180;
 constexpr std::uintptr_t kWaTeamNameStride = 0xBB8;
 constexpr std::uintptr_t kWaCurrentTeamByteOffset = 0xD9DC;
 constexpr std::intptr_t kWaTeamByteListOffset = -0x768;
-constexpr int kMaxWallTouchSweepPixels = 256;
-constexpr int kWallTouchBounceRadiusPixels = 28;
+constexpr int kMaxWallTouchSweepPixels = 384;
+constexpr int kWallTouchBounceRadiusPixels = 36;
 constexpr int kMinWallTouchBounceVelocityPixels = 2;
 constexpr int kActiveWormReferenceKeepDistancePixels = 512;
 constexpr DWORD kActiveWormRefreshIntervalMilliseconds = 50;
+constexpr LONG kUnknownWallTouchTurnTeamByte = -1;
 
 bool waObjectKindLooksLikeWorm(LONG objectKind) {
     return objectKind == kWaObjectKindWorm || objectKind == 101;
@@ -295,6 +296,7 @@ volatile LONG g_activeWormCandidateScanTick = 0;
 volatile LONG g_activeWormCandidateScanMissLogCount = 0;
 volatile LONG g_activeWormMovementLogCount = 0;
 volatile LONG g_wallTouchTurnOwnerAddress = 0;
+volatile LONG g_wallTouchTurnTeamByte = kUnknownWallTouchTurnTeamByte;
 volatile LONG g_wallTouchResetLogCount = 0;
 volatile LONG g_wormMotionCandidateProbeHits = 0;
 volatile LONG g_wormMotionCandidateProbeLogCount = 0;
@@ -599,15 +601,6 @@ int fixedDeltaToPixels(LONG fixedDelta) {
     return static_cast<int>(fixedDelta / kFixedPointOne);
 }
 
-LONG readWaObjectLong(void* owner, std::uintptr_t offset) {
-    if (owner == nullptr) {
-        return 0;
-    }
-
-    const auto address = reinterpret_cast<std::uintptr_t>(owner) + offset;
-    return *reinterpret_cast<volatile LONG*>(address);
-}
-
 bool isReadableMemoryRange(std::uintptr_t address, std::size_t bytes) {
     if (address < 0x10000 || bytes == 0) {
         return false;
@@ -645,6 +638,16 @@ bool tryReadLong(std::uintptr_t address, LONG& value) {
 
     value = *reinterpret_cast<volatile LONG*>(address);
     return true;
+}
+
+LONG readWaObjectLong(void* owner, std::uintptr_t offset) {
+    if (owner == nullptr) {
+        return 0;
+    }
+
+    const auto address = reinterpret_cast<std::uintptr_t>(owner) + offset;
+    LONG value = 0;
+    return tryReadLong(address, value) ? value : 0;
 }
 
 bool tryReadByte(std::uintptr_t address, BYTE& value) {
@@ -721,9 +724,103 @@ std::size_t resetTouchedOverlayWallsForNewTurn() {
     return resetCount;
 }
 
+bool tryReadCurrentActiveTeamByteFromOwner(std::uintptr_t ownerAddress, BYTE& activeTeamByte) {
+    if (ownerAddress == 0) {
+        return false;
+    }
+
+    LONG stateAddressLong = 0;
+    if (!tryReadLong(ownerAddress + kWaObjectStateOffset, stateAddressLong)) {
+        return false;
+    }
+
+    const auto stateAddress = static_cast<std::uintptr_t>(stateAddressLong);
+    LONG stateUiAddressLong = 0;
+    if (!tryReadLong(stateAddress + 0x24, stateUiAddressLong)) {
+        return false;
+    }
+
+    const auto stateUiAddress = static_cast<std::uintptr_t>(stateUiAddressLong);
+    return tryReadByte(stateUiAddress + kWaCurrentTeamByteOffset, activeTeamByte);
+}
+
+bool currentActiveTeamByteFromKnownWormSamples(BYTE& activeTeamByte) {
+    const DWORD now = GetTickCount();
+
+    for (const WormLiveSample& sample : g_wormLiveSamples) {
+        const LONG ownerAddressLong = sample.ownerAddress;
+        if (ownerAddressLong == 0) {
+            continue;
+        }
+
+        const DWORD sampleTick = static_cast<DWORD>(
+            sample.lastPollTick != 0 ? sample.lastPollTick : sample.tick);
+        if (sampleTick != 0 && now - sampleTick > 30000) {
+            continue;
+        }
+
+        const auto ownerAddress = static_cast<std::uintptr_t>(ownerAddressLong);
+        if (tryReadCurrentActiveTeamByteFromOwner(ownerAddress, activeTeamByte)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void clearActiveWormCandidateForTurnChange() {
+    InterlockedExchange(&g_activeWormCandidateOwnerAddress, 0);
+    InterlockedExchange(&g_activeWormCandidateBaseAddress, 0);
+    InterlockedExchange(&g_activeWormCandidateXOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateYOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateOffsetValid, 0);
+    InterlockedExchange(&g_activeWormCandidateSourceKind, 0);
+    InterlockedExchange(&g_activeWormCandidateSourceOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
+    InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
+}
+
+void resetTouchedOverlayWallsWhenActiveTeamChanges() {
+    BYTE activeTeamByte = 0;
+    if (!currentActiveTeamByteFromKnownWormSamples(activeTeamByte)) {
+        return;
+    }
+
+    const LONG activeTeamLong = static_cast<LONG>(activeTeamByte);
+    const LONG previousTeamLong = InterlockedExchange(&g_wallTouchTurnTeamByte, activeTeamLong);
+    if (previousTeamLong == kUnknownWallTouchTurnTeamByte || previousTeamLong == activeTeamLong) {
+        return;
+    }
+
+    clearActiveWormCandidateForTurnChange();
+    const std::size_t resetCount = resetTouchedOverlayWallsForNewTurn();
+    if (resetCount == 0) {
+        return;
+    }
+
+    if (g_runtimeProbeLogger != nullptr && g_wallTouchResetLogCount < 32) {
+        InterlockedIncrement(&g_wallTouchResetLogCount);
+
+        std::ostringstream message;
+        message << "runtime probe: wall touch state reset for active team change from "
+                << previousTeamLong
+                << " to "
+                << activeTeamLong
+                << ", reset "
+                << resetCount
+                << " touched wall(s)";
+        g_runtimeProbeLogger->info(message.str());
+    }
+}
+
 void resetTouchedOverlayWallsWhenActiveOwnerChanges(std::uintptr_t ownerAddress) {
     if (ownerAddress == 0) {
         return;
+    }
+
+    BYTE activeTeamByte = 0;
+    if (tryReadCurrentActiveTeamByteFromOwner(ownerAddress, activeTeamByte)) {
+        InterlockedExchange(&g_wallTouchTurnTeamByte, static_cast<LONG>(activeTeamByte));
     }
 
     const LONG ownerAddressLong = static_cast<LONG>(ownerAddress);
@@ -812,6 +909,89 @@ const WormLiveSample* findWormLiveSampleByOwner(std::uintptr_t ownerAddress) {
     }
 
     return nullptr;
+}
+
+void resetWormLiveSampleTransientHistory(WormLiveSample& sample) {
+    if (sample.ownerAddress == 0) {
+        return;
+    }
+
+    InterlockedExchange(&sample.xFixed, 0);
+    InterlockedExchange(&sample.yFixed, 0);
+    InterlockedExchange(&sample.xPixels, 0);
+    InterlockedExchange(&sample.yPixels, 0);
+    InterlockedExchange(&sample.hits, 0);
+    InterlockedExchange(&sample.tick, 0);
+    InterlockedExchange(&sample.primaryXFixed, 0);
+    InterlockedExchange(&sample.primaryYFixed, 0);
+    InterlockedExchange(&sample.primaryXPixels, 0);
+    InterlockedExchange(&sample.primaryYPixels, 0);
+    InterlockedExchange(&sample.primaryValid, 0);
+    InterlockedExchange(&sample.olderPrimaryXFixed, 0);
+    InterlockedExchange(&sample.olderPrimaryYFixed, 0);
+    InterlockedExchange(&sample.olderPrimaryXPixels, 0);
+    InterlockedExchange(&sample.olderPrimaryYPixels, 0);
+    InterlockedExchange(&sample.previousPrimaryXFixed, 0);
+    InterlockedExchange(&sample.previousPrimaryYFixed, 0);
+    InterlockedExchange(&sample.previousPrimaryXPixels, 0);
+    InterlockedExchange(&sample.previousPrimaryYPixels, 0);
+    InterlockedExchange(&sample.primaryHistoryCount, 0);
+    InterlockedExchange(&sample.lastMotionTick, 0);
+    InterlockedExchange(&sample.lastPollTick, 0);
+    InterlockedExchange(&sample.motionScore, 0);
+}
+
+void resetTransientGameplayTrackingState() {
+    const std::size_t resetWallCount = resetTouchedOverlayWallsForNewTurn();
+    if (resetWallCount != 0 && g_runtimeProbeLogger != nullptr && g_wallTouchResetLogCount < 32) {
+        InterlockedIncrement(&g_wallTouchResetLogCount);
+
+        std::ostringstream message;
+        message << "runtime probe: wall touch state reset for D3D context transition, reset "
+                << resetWallCount
+                << " touched wall(s)";
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    InterlockedExchange(&g_cameraTrackingPointAddress, 0);
+    InterlockedExchange(&g_cameraTrackingXFixed, 0);
+    InterlockedExchange(&g_cameraTrackingYFixed, 0);
+    InterlockedExchange(&g_cameraRenderPointAddress, 0);
+    InterlockedExchange(&g_cameraRenderXFixed, 0);
+    InterlockedExchange(&g_cameraRenderYFixed, 0);
+    InterlockedExchange(&g_cameraRenderSampleValid, 0);
+    InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
+    InterlockedExchange(&g_cameraTrackingBaselineXFixed, 0);
+    InterlockedExchange(&g_cameraTrackingBaselineYFixed, 0);
+    InterlockedExchange(&g_cameraTrackingZeroSampleLogHits, 0);
+
+    InterlockedExchange(&g_trackingTargetReferenceCenterX, 0);
+    InterlockedExchange(&g_trackingTargetReferenceCenterY, 0);
+    InterlockedExchange(&g_trackingTargetReferenceTick, 0);
+    InterlockedExchange(&g_trackingTargetReferenceValid, 0);
+
+    InterlockedExchange(&g_activeWormCandidateOwnerAddress, 0);
+    InterlockedExchange(&g_activeWormCandidateBaseAddress, 0);
+    InterlockedExchange(&g_activeWormCandidateXOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateYOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateOffsetValid, 0);
+    InterlockedExchange(&g_activeWormCandidateSourceKind, 0);
+    InterlockedExchange(&g_activeWormCandidateSourceOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateLastXFixed, 0);
+    InterlockedExchange(&g_activeWormCandidateLastYFixed, 0);
+    InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
+    InterlockedExchange(&g_activeWormCandidateScanTick, 0);
+    InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
+    InterlockedExchange(&g_wallTouchTurnTeamByte, kUnknownWallTouchTurnTeamByte);
+    InterlockedExchange(&g_activeWormCandidateLogCount, 0);
+    InterlockedExchange(&g_activeWormCandidatePollLogCount, 0);
+    InterlockedExchange(&g_activeWormCandidateScanMissLogCount, 0);
+    InterlockedExchange(&g_activeWormMovementLogCount, 0);
+    InterlockedExchange(&g_wormMotionCandidateProbeLogCount, 0);
+
+    for (WormLiveSample& sample : g_wormLiveSamples) {
+        resetWormLiveSampleTransientHistory(sample);
+    }
 }
 
 void rememberWormLiveSample(
@@ -976,6 +1156,163 @@ bool wormSampleBestKnownFixed(
     return candidateLooksLikeMapCoordinate(xFixed, yFixed);
 }
 
+bool publishActiveWormCandidateFromLiveSample(const WormLiveSample& sample, const char* selectionReason) {
+    const LONG ownerAddressLong = sample.ownerAddress;
+    if (ownerAddressLong == 0) {
+        return false;
+    }
+
+    LONG xFixed = 0;
+    LONG yFixed = 0;
+    LONG xOffset = -1;
+    LONG yOffset = -1;
+    if (!wormSampleBestKnownFixed(sample, xFixed, yFixed, xOffset, yOffset)) {
+        return false;
+    }
+
+    const auto ownerAddress = static_cast<std::uintptr_t>(ownerAddressLong);
+    const LONG previousActiveOwner = g_activeWormCandidateOwnerAddress;
+    publishActiveWormCoordinateCandidate(
+        reinterpret_cast<void*>(ownerAddress),
+        ownerAddress,
+        xOffset,
+        yOffset,
+        xFixed,
+        yFixed,
+        4,
+        xOffset);
+
+    if (g_runtimeProbeLogger != nullptr
+        && g_activeWormMovementLogCount < 64
+        && previousActiveOwner != ownerAddressLong) {
+        InterlockedIncrement(&g_activeWormMovementLogCount);
+
+        std::ostringstream message;
+        message << "runtime probe: active worm selected from "
+                << selectionReason
+                << " owner "
+                << formatAddress(ownerAddress)
+                << " team "
+                << sample.teamIndex
+                << " worm "
+                << sample.wormIndex
+                << " pixels "
+                << fixedDeltaToPixels(xFixed)
+                << ","
+                << fixedDeltaToPixels(yFixed)
+                << " source +"
+                << formatAddress(static_cast<std::uintptr_t>(xOffset));
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return true;
+}
+
+bool selectActiveWormCandidateFromCurrentTeamSamples() {
+    const DWORD now = GetTickCount();
+    const WormLiveSample* bestSample = nullptr;
+    LONG bestScore = INT32_MAX;
+    const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
+
+    for (const WormLiveSample& sample : g_wormLiveSamples) {
+        const LONG ownerAddressLong = sample.ownerAddress;
+        const DWORD sampleTick = static_cast<DWORD>(
+            sample.lastPollTick != 0 ? sample.lastPollTick : sample.tick);
+        if (ownerAddressLong == 0 || sampleTick == 0 || now - sampleTick > 3000 || sample.aliveFlag == 0) {
+            continue;
+        }
+
+        const auto ownerAddress = static_cast<std::uintptr_t>(ownerAddressLong);
+        if (!waObjectCurrentTeamMatches(reinterpret_cast<void*>(ownerAddress))) {
+            continue;
+        }
+
+        LONG xFixed = 0;
+        LONG yFixed = 0;
+        LONG xOffset = -1;
+        LONG yOffset = -1;
+        if (!wormSampleBestKnownFixed(sample, xFixed, yFixed, xOffset, yOffset)) {
+            continue;
+        }
+
+        const DWORD motionTick = static_cast<DWORD>(sample.lastMotionTick);
+        const bool hasRecentMotion = motionTick != 0 && now - motionTick <= 3000;
+        LONG score = static_cast<LONG>(std::min<DWORD>(now - sampleTick, 3000));
+        if (hasRecentMotion) {
+            score -= 200000;
+            score += static_cast<LONG>(std::min<DWORD>(now - motionTick, 3000));
+        } else {
+            score += 50000;
+        }
+
+        if (ownerAddressLong == activeOwnerAddress && g_activeWormCandidateSourceKind == 4) {
+            score -= 100000;
+        }
+
+        const LONG motionScore = sample.motionScore;
+        score -= std::min<LONG>(motionScore, 10000);
+
+        if (bestSample == nullptr || score < bestScore) {
+            bestSample = &sample;
+            bestScore = score;
+        }
+    }
+
+    if (bestSample == nullptr) {
+        return false;
+    }
+
+    return publishActiveWormCandidateFromLiveSample(*bestSample, "current-team live sample");
+}
+
+bool selectActiveWormCandidateFromRecentMotionSamples(const char* selectionReason) {
+    const DWORD now = GetTickCount();
+    const WormLiveSample* bestSample = nullptr;
+    LONG bestScore = INT32_MAX;
+
+    for (const WormLiveSample& sample : g_wormLiveSamples) {
+        const LONG ownerAddressLong = sample.ownerAddress;
+        const DWORD sampleTick = static_cast<DWORD>(
+            sample.lastPollTick != 0 ? sample.lastPollTick : sample.tick);
+        const DWORD motionTick = static_cast<DWORD>(sample.lastMotionTick);
+        if (ownerAddressLong == 0
+            || sampleTick == 0
+            || motionTick == 0
+            || now - sampleTick > 3000
+            || now - motionTick > 1500
+            || sample.aliveFlag == 0
+            || sample.motionScore <= 0) {
+            continue;
+        }
+
+        LONG xFixed = 0;
+        LONG yFixed = 0;
+        LONG xOffset = -1;
+        LONG yOffset = -1;
+        if (!wormSampleBestKnownFixed(sample, xFixed, yFixed, xOffset, yOffset)) {
+            continue;
+        }
+
+        LONG score = static_cast<LONG>(std::min<DWORD>(now - motionTick, 1500));
+        const LONG motionScore = sample.motionScore;
+        score -= std::min<LONG>(motionScore, 10000);
+        if (ownerAddressLong == g_activeWormCandidateOwnerAddress && g_activeWormCandidateSourceKind == 4) {
+            score -= 200000;
+        }
+
+        if (bestSample == nullptr || score < bestScore) {
+            bestSample = &sample;
+            bestScore = score;
+        }
+    }
+
+    if (bestSample == nullptr) {
+        return false;
+    }
+
+    return publishActiveWormCandidateFromLiveSample(*bestSample, selectionReason);
+}
+
 void pollWormLiveSamplesFromMemory() {
     const DWORD now = GetTickCount();
 
@@ -1071,16 +1408,22 @@ void pollWormLiveSamplesFromMemory() {
         InterlockedExchange(&sample.motionScore, newScore);
         InterlockedExchange(&sample.lastMotionTick, static_cast<LONG>(now));
 
+        const bool currentTeamMatches = waObjectCurrentTeamMatches(reinterpret_cast<void*>(ownerAddress));
+        const bool alreadyActiveWorm = ownerAddressLong == g_activeWormCandidateOwnerAddress
+            && g_activeWormCandidateSourceKind == 4;
+        const bool noActiveWormCandidate = g_activeWormCandidateOffsetValid == 0
+            || g_activeWormCandidateOwnerAddress == 0;
+        const bool movementFallback = noActiveWormCandidate && movementPixels >= 2;
+        if (!currentTeamMatches && !alreadyActiveWorm && !movementFallback) {
+            continue;
+        }
+
         const LONG previousActiveOwner = g_activeWormCandidateOwnerAddress;
-        publishActiveWormCoordinateCandidate(
-            reinterpret_cast<void*>(ownerAddress),
-            ownerAddress,
-            static_cast<LONG>(kWaObjectPrimaryXOffset),
-            static_cast<LONG>(kWaObjectPrimaryYOffset),
-            xFixed,
-            yFixed,
-            4,
-            static_cast<LONG>(kWaObjectPrimaryXOffset));
+        publishActiveWormCandidateFromLiveSample(
+            sample,
+            currentTeamMatches
+                ? "current-team primary movement"
+                : (alreadyActiveWorm ? "active primary movement" : "fallback primary movement"));
 
         if (g_runtimeProbeLogger != nullptr
             && g_activeWormMovementLogCount < 64
@@ -1105,7 +1448,9 @@ void pollWormLiveSamplesFromMemory() {
                     << ","
                     << previousYPixels
                     << " score "
-                    << newScore;
+                    << newScore
+                    << " currentTeam "
+                    << (currentTeamMatches ? "yes" : "no");
             g_runtimeProbeLogger->info(message.str());
         }
     }
@@ -1681,12 +2026,6 @@ void invalidateActiveWormCoordinateCandidate() {
 }
 
 void refreshActiveWormCandidateFromTrackingTarget() {
-    int referenceX = 0;
-    int referenceY = 0;
-    if (!currentTrackingReference(referenceX, referenceY)) {
-        return;
-    }
-
     const DWORD now = GetTickCount();
     const DWORD previousRefresh = static_cast<DWORD>(g_activeWormCandidateRefreshTick);
     if (previousRefresh != 0 && now - previousRefresh < kActiveWormRefreshIntervalMilliseconds) {
@@ -1696,6 +2035,32 @@ void refreshActiveWormCandidateFromTrackingTarget() {
 
     int candidateX = 0;
     int candidateY = 0;
+    if (readActiveWormCandidatePixels(candidateX, candidateY)) {
+        if (g_activeWormCandidateSourceKind == 4) {
+            const auto ownerAddress = static_cast<std::uintptr_t>(g_activeWormCandidateOwnerAddress);
+            if (ownerAddress != 0
+                && waObjectCurrentTeamMatches(reinterpret_cast<void*>(ownerAddress))) {
+                return;
+            }
+
+            clearActiveWormCandidateForTurnChange();
+        }
+    }
+
+    if (selectActiveWormCandidateFromCurrentTeamSamples()) {
+        return;
+    }
+
+    if (selectActiveWormCandidateFromRecentMotionSamples("recent motion fallback")) {
+        return;
+    }
+
+    int referenceX = 0;
+    int referenceY = 0;
+    if (!currentTrackingReference(referenceX, referenceY)) {
+        return;
+    }
+
     if (readActiveWormCandidatePixels(candidateX, candidateY)) {
         if (g_activeWormCandidateSourceKind == 4) {
             return;
@@ -1876,6 +2241,15 @@ extern "C" void __cdecl recordWaCameraTrackingPoint(void* point) noexcept {
     }
 
     const std::uintptr_t pointAddress = reinterpret_cast<std::uintptr_t>(point);
+    LONG xFixed = 0;
+    LONG yFixed = 0;
+    if (!tryReadLong(pointAddress, xFixed)
+        || !tryReadLong(pointAddress + sizeof(LONG), yFixed)) {
+        InterlockedExchange(&g_cameraTrackingPointAddress, 0);
+        InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
+        return;
+    }
+
     const LONG previousPointAddress = InterlockedExchange(
         &g_cameraTrackingPointAddress,
         static_cast<LONG>(pointAddress));
@@ -1883,9 +2257,6 @@ extern "C" void __cdecl recordWaCameraTrackingPoint(void* point) noexcept {
         InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
     }
 
-    volatile LONG* values = reinterpret_cast<volatile LONG*>(point);
-    const LONG xFixed = values[0];
-    const LONG yFixed = values[1];
     InterlockedExchange(&g_cameraTrackingXFixed, xFixed);
     InterlockedExchange(&g_cameraTrackingYFixed, yFixed);
 
@@ -2155,6 +2526,14 @@ extern "C" void __cdecl recordWaCameraRenderOwner(void* owner) noexcept {
 
     const std::uintptr_t pointAddress =
         reinterpret_cast<std::uintptr_t>(owner) + kWaCameraPointStructOffset;
+    LONG xFixed = 0;
+    LONG yFixed = 0;
+    if (!tryReadLong(pointAddress, xFixed)
+        || !tryReadLong(pointAddress + sizeof(LONG), yFixed)) {
+        InterlockedExchange(&g_cameraRenderSampleValid, 0);
+        return;
+    }
+
     const LONG previousPointAddress = InterlockedExchange(
         &g_cameraRenderPointAddress,
         static_cast<LONG>(pointAddress));
@@ -2162,9 +2541,6 @@ extern "C" void __cdecl recordWaCameraRenderOwner(void* owner) noexcept {
         InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
     }
 
-    volatile LONG* values = reinterpret_cast<volatile LONG*>(pointAddress);
-    const LONG xFixed = values[0];
-    const LONG yFixed = values[1];
     InterlockedExchange(&g_cameraRenderXFixed, xFixed);
     InterlockedExchange(&g_cameraRenderYFixed, yFixed);
     InterlockedExchange(&g_cameraRenderSampleValid, 1);
@@ -2204,9 +2580,12 @@ CameraTrackingSnapshot currentCameraTrackingSnapshot(int slot) {
         snapshot.xFixed = g_cameraTrackingXFixed;
         snapshot.yFixed = g_cameraTrackingYFixed;
     } else {
-        volatile LONG* values = reinterpret_cast<volatile LONG*>(snapshot.pointAddress);
-        snapshot.xFixed = values[0];
-        snapshot.yFixed = values[1];
+        if (!tryReadLong(snapshot.pointAddress, snapshot.xFixed)
+            || !tryReadLong(snapshot.pointAddress + sizeof(LONG), snapshot.yFixed)) {
+            InterlockedExchange(&g_cameraTrackingPointAddress, 0);
+            InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
+            return snapshot;
+        }
     }
 
     if (snapshot.xFixed == 0 && snapshot.yFixed == 0) {
@@ -2252,15 +2631,22 @@ CameraTrackingSnapshot currentCameraTrackingSnapshot(int slot) {
 }
 
 bool readTrackingTargetFromEntry(std::uintptr_t entryAddress, int slot, TrackingTargetSnapshot& snapshot) {
-    volatile LONG* entry = reinterpret_cast<volatile LONG*>(entryAddress);
-    if (entry[0] == 0) {
+    LONG entryFlag = 0;
+    if (!tryReadLong(entryAddress, entryFlag) || entryFlag == 0) {
         return false;
     }
 
-    const LONG leftFixed = entry[1];
-    const LONG topFixed = entry[2];
-    const LONG rightFixed = entry[3];
-    const LONG bottomFixed = entry[4];
+    LONG leftFixed = 0;
+    LONG topFixed = 0;
+    LONG rightFixed = 0;
+    LONG bottomFixed = 0;
+    if (!tryReadLong(entryAddress + sizeof(LONG), leftFixed)
+        || !tryReadLong(entryAddress + (sizeof(LONG) * 2), topFixed)
+        || !tryReadLong(entryAddress + (sizeof(LONG) * 3), rightFixed)
+        || !tryReadLong(entryAddress + (sizeof(LONG) * 4), bottomFixed)) {
+        return false;
+    }
+
     if (leftFixed == rightFixed || topFixed == bottomFixed) {
         return false;
     }
@@ -2286,14 +2672,28 @@ TrackingTargetSnapshot currentTrackingTargetSnapshot() {
 
     const std::uintptr_t stateBase =
         static_cast<std::uintptr_t>(trackingPointAddress) - kWaCameraPointStructOffset;
+    if (!isReadableMemoryRange(stateBase + 0x72E4, 0x739C + sizeof(LONG) - 0x72E4)) {
+        InterlockedExchange(&g_cameraTrackingPointAddress, 0);
+        InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
+        return snapshot;
+    }
 
-    volatile LONG* activeTargetFlag = reinterpret_cast<volatile LONG*>(stateBase + 0x739C);
-    if (*activeTargetFlag != 0) {
-        volatile LONG* activeTarget = reinterpret_cast<volatile LONG*>(stateBase + 0x73A0);
-        const LONG leftFixed = activeTarget[0];
-        const LONG topFixed = activeTarget[1];
-        const LONG rightFixed = activeTarget[2];
-        const LONG bottomFixed = activeTarget[3];
+    LONG activeTargetFlag = 0;
+    if (tryReadLong(stateBase + 0x739C, activeTargetFlag) && activeTargetFlag != 0) {
+        LONG leftFixed = 0;
+        LONG topFixed = 0;
+        LONG rightFixed = 0;
+        LONG bottomFixed = 0;
+        const std::uintptr_t activeTargetAddress = stateBase + 0x73A0;
+        if (!tryReadLong(activeTargetAddress, leftFixed)
+            || !tryReadLong(activeTargetAddress + sizeof(LONG), topFixed)
+            || !tryReadLong(activeTargetAddress + (sizeof(LONG) * 2), rightFixed)
+            || !tryReadLong(activeTargetAddress + (sizeof(LONG) * 3), bottomFixed)) {
+            InterlockedExchange(&g_cameraTrackingPointAddress, 0);
+            InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
+            return snapshot;
+        }
+
         if (leftFixed != rightFixed && topFixed != bottomFixed) {
             snapshot.available = true;
             snapshot.slot = -1;
@@ -2307,8 +2707,13 @@ TrackingTargetSnapshot currentTrackingTargetSnapshot() {
         }
     }
 
-    volatile LONG* queueLimitValue = reinterpret_cast<volatile LONG*>(stateBase + 0x72E4);
-    LONG queueLimit = *queueLimitValue;
+    LONG queueLimit = 0;
+    if (!tryReadLong(stateBase + 0x72E4, queueLimit)) {
+        InterlockedExchange(&g_cameraTrackingPointAddress, 0);
+        InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
+        return snapshot;
+    }
+
     if (queueLimit < 0) {
         return snapshot;
     }
@@ -3580,6 +3985,7 @@ void updateTouchedOverlayWallsFromActiveWorm() {
         return;
     }
 
+    resetTouchedOverlayWallsWhenActiveTeamChanges();
     refreshActiveWormCandidateFromTrackingTarget();
 
     int olderX = 0;
@@ -4001,6 +4407,8 @@ HRESULT STDMETHODCALLTYPE hookedD3D9DeviceReset(
     if (originalReset == nullptr) {
         return D3DERR_INVALIDCALL;
     }
+
+    resetTransientGameplayTrackingState();
 
     HRESULT result = originalReset(device, presentationParameters);
     if (hits <= 8 && g_runtimeProbeLogger != nullptr) {
@@ -4918,6 +5326,9 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_direct3D9MetadataOverlayLastCameraDeltaValid, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayCameraDeltaLogCount, 0);
     InterlockedExchange(&g_direct3D9WallTouchLogCount, 0);
+    InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
+    InterlockedExchange(&g_wallTouchTurnTeamByte, kUnknownWallTouchTurnTeamByte);
+    InterlockedExchange(&g_wallTouchResetLogCount, 0);
 
     if (enableDirect3D9Probe && !enableRendererApiProbe) {
         error = "Direct3D9 probe requires EnableRendererApiProbe=1";
