@@ -30,6 +30,19 @@ struct WaOverlayTransform {
     int cameraSlot = 0;
     bool trackingTargetOverlayTest = false;
     int touchRadiusPixels = 8;
+    std::string mapCachePath;
+    std::string customDatPath;
+    std::string cachedMapPath;
+    std::uint64_t cachedMapCustomDatWriteTime = 0;
+};
+
+struct WaOverlayMap {
+    std::string name;
+    std::string fileName;
+    std::string sha256;
+    int width = 0;
+    int height = 0;
+    std::vector<WaOverlayRect> rects;
 };
 
 class X86DetourHook {
@@ -93,6 +106,7 @@ public:
         bool enableDirect3D9DeviceSlotProbe,
         bool enableDirect3D9OverlaySmokeTest,
         const std::vector<WaOverlayRect>& direct3D9OverlayTestRects,
+        const std::vector<WaOverlayMap>& direct3D9OverlayMaps,
         const WaOverlayTransform& direct3D9OverlayTransform,
         std::string& error);
 
@@ -103,9 +117,12 @@ private:
     IatHook stretchBltHook_;
     IatHook loadLibraryAHook_;
     IatHook getProcAddressHook_;
+    IatHook createFileAHook_;
+    IatHook createFileWHook_;
     X86DetourHook cameraTrackingHook_;
     X86DetourHook cameraRenderCopyHook_;
     X86DetourHook cameraTargetAggregateHook_;
+    X86DetourHook gameTimerTransitionHook_;
     X86DetourHook wormMotionCandidateHook_;
     bool initialized_ = false;
 };

@@ -1,5 +1,7 @@
 const elements = {
+  mapButton: document.getElementById("mapButton"),
   mapInput: document.getElementById("mapInput"),
+  iniButton: document.getElementById("iniButton"),
   iniInput: document.getElementById("iniInput"),
   mapInfo: document.getElementById("mapInfo"),
   canvas: document.getElementById("mapCanvas"),
@@ -34,6 +36,37 @@ const elements = {
 
 const context = elements.canvas.getContext("2d");
 
+const pickerOptions = {
+  map: {
+    id: "wk-wall2wall-savedlevels",
+    types: [
+      {
+        description: "Worms Armageddon map images",
+        accept: {
+          "image/png": [".png"],
+          "image/jpeg": [".jpg", ".jpeg"],
+          "image/bmp": [".bmp"],
+          "image/gif": [".gif"],
+          "image/webp": [".webp"],
+        },
+      },
+    ],
+    excludeAcceptAllOption: false,
+  },
+  ini: {
+    id: "wk-wall2wall-walls",
+    types: [
+      {
+        description: "wkWall2Wall metadata",
+        accept: {
+          "text/plain": [".ini"],
+        },
+      },
+    ],
+    excludeAcceptAllOption: false,
+  },
+};
+
 const state = {
   image: null,
   imageUrl: "",
@@ -56,6 +89,73 @@ const state = {
 
 function setStatus(message) {
   elements.status.textContent = message;
+}
+
+function isAbortError(error) {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function supportsOpenFilePicker() {
+  return typeof window.showOpenFilePicker === "function";
+}
+
+function supportsSaveFilePicker() {
+  return typeof window.showSaveFilePicker === "function";
+}
+
+function shouldFallbackToFileInput(error) {
+  return error instanceof TypeError
+    || error instanceof DOMException && error.name === "SecurityError";
+}
+
+async function chooseMapFile() {
+  if (!supportsOpenFilePicker()) {
+    elements.mapInput.click();
+    return;
+  }
+
+  try {
+    const [handle] = await window.showOpenFilePicker(pickerOptions.map);
+    if (!handle) {
+      return;
+    }
+    await loadMap(await handle.getFile());
+  } catch (error) {
+    if (isAbortError(error)) {
+      setStatus("Map selection canceled.");
+      return;
+    }
+    if (shouldFallbackToFileInput(error)) {
+      elements.mapInput.click();
+      return;
+    }
+    setStatus(error instanceof Error ? error.message : "Map load failed.");
+  }
+}
+
+async function chooseIniFile() {
+  if (!supportsOpenFilePicker()) {
+    elements.iniInput.click();
+    return;
+  }
+
+  try {
+    const [handle] = await window.showOpenFilePicker(pickerOptions.ini);
+    if (!handle) {
+      return;
+    }
+    await importIni(await handle.getFile());
+  } catch (error) {
+    if (isAbortError(error)) {
+      setStatus("INI import canceled.");
+      return;
+    }
+    if (shouldFallbackToFileInput(error)) {
+      elements.iniInput.click();
+      return;
+    }
+    setStatus(error instanceof Error ? error.message : "INI import failed.");
+  }
 }
 
 function cloneWalls(walls) {
@@ -651,7 +751,41 @@ function updateSelectedFromInspector() {
   updateActionButtons();
 }
 
-function exportIni() {
+function downloadBlob(blob, fileName) {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(link.href);
+}
+
+async function saveBlob(blob, fileName) {
+  if (!supportsSaveFilePicker()) {
+    downloadBlob(blob, fileName);
+    return "downloaded";
+  }
+
+  try {
+    const handle = await window.showSaveFilePicker({
+      ...pickerOptions.ini,
+      suggestedName: fileName,
+    });
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return "saved";
+  } catch (error) {
+    if (isAbortError(error)) {
+      return "canceled";
+    }
+    downloadBlob(blob, fileName);
+    return "downloaded";
+  }
+}
+
+async function exportIni() {
   if (!state.image) {
     setStatus("Load a map before exporting.");
     return;
@@ -679,13 +813,14 @@ function exportIni() {
     lines.push("");
   });
 
+  const fileName = `${state.mapName}.w2w.ini`;
   const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = `${state.mapName}.w2w.ini`;
-  link.click();
-  URL.revokeObjectURL(link.href);
-  setStatus(`Exported ${state.walls.length} wall(s).`);
+  const result = await saveBlob(blob, fileName);
+  if (result === "canceled") {
+    setStatus("Export canceled.");
+    return;
+  }
+  setStatus(`${result === "saved" ? "Saved" : "Downloaded"} ${state.walls.length} wall(s).`);
 }
 
 function deleteSelectedWall() {
@@ -808,11 +943,25 @@ async function handleMapInput(event) {
     await loadMap(event.target.files[0]);
   } catch (error) {
     setStatus(error instanceof Error ? error.message : "Map load failed.");
+  } finally {
+    event.target.value = "";
   }
 }
 
+async function handleIniInput(event) {
+  try {
+    await importIni(event.target.files[0]);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : "INI import failed.");
+  } finally {
+    event.target.value = "";
+  }
+}
+
+elements.mapButton.addEventListener("click", chooseMapFile);
+elements.iniButton.addEventListener("click", chooseIniFile);
 elements.mapInput.addEventListener("change", handleMapInput);
-elements.iniInput.addEventListener("change", (event) => importIni(event.target.files[0]));
+elements.iniInput.addEventListener("change", handleIniInput);
 elements.exportButton.addEventListener("click", exportIni);
 elements.zoomOutButton.addEventListener("click", () => setZoom(state.zoom / 1.25));
 elements.zoomInButton.addEventListener("click", () => setZoom(state.zoom * 1.25));

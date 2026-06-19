@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <sstream>
@@ -52,6 +53,108 @@ std::string joinPath(const std::string& directory, const std::string& child) {
     return directory + "\\" + child;
 }
 
+std::string readStringValue(const std::string& path, const char* section, const char* key, const char* fallback = "") {
+    char buffer[1024] = {};
+    GetPrivateProfileStringA(section, key, fallback, buffer, static_cast<DWORD>(sizeof(buffer)), path.c_str());
+    return buffer;
+}
+
+std::string lowerAscii(const std::string& value) {
+    std::string output;
+    output.reserve(value.size());
+    for (const char character : value) {
+        output.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+    }
+    return output;
+}
+
+std::string fileNameOnlyFromPath(const std::string& path) {
+    const std::string::size_type slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) {
+        return path;
+    }
+
+    return path.substr(slash + 1);
+}
+
+bool sameAsciiText(const std::string& left, const std::string& right) {
+    return !left.empty() && !right.empty() && lowerAscii(left) == lowerAscii(right);
+}
+
+bool overlayCatalogHasFileName(const std::vector<WaOverlayMap>& maps, const std::string& fileName) {
+    const std::string candidateFileName = fileNameOnlyFromPath(fileName);
+    for (const WaOverlayMap& map : maps) {
+        if (sameAsciiText(fileNameOnlyFromPath(map.fileName), candidateFileName)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::uint64_t fileWriteTimeUtc(const std::string& path) {
+    if (path.empty()) {
+        return 0;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attributes)) {
+        return 0;
+    }
+
+    return (static_cast<std::uint64_t>(attributes.ftLastWriteTime.dwHighDateTime) << 32)
+        | static_cast<std::uint64_t>(attributes.ftLastWriteTime.dwLowDateTime);
+}
+
+std::uint64_t parseUnsigned64(const std::string& value) {
+    if (value.empty()) {
+        return 0;
+    }
+
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str()) {
+        return 0;
+    }
+
+    return static_cast<std::uint64_t>(parsed);
+}
+
+std::string readCachedMapPath(
+    const std::string& cachePath,
+    const std::string& customDatPath,
+    const std::vector<WaOverlayMap>& overlayMaps,
+    Logger& logger,
+    std::uint64_t& cachedCustomDatWriteTime) {
+    cachedCustomDatWriteTime = 0;
+    if (cachePath.empty() || overlayMaps.empty()) {
+        return {};
+    }
+
+    const int hasMetadata = GetPrivateProfileIntA("Map", "LastHasMetadata", 0, cachePath.c_str());
+    if (hasMetadata == 0) {
+        return {};
+    }
+
+    const std::string cachedPath = readStringValue(cachePath, "Map", "LastPath");
+    const std::string cachedFile = readStringValue(cachePath, "Map", "LastFile");
+    const std::string candidate = !cachedPath.empty() ? cachedPath : cachedFile;
+    if (candidate.empty() || !overlayCatalogHasFileName(overlayMaps, candidate)) {
+        return {};
+    }
+
+    const std::uint64_t cachedTime = parseUnsigned64(
+        readStringValue(cachePath, "Map", "CustomDatWriteTimeUtc"));
+    const std::uint64_t currentTime = fileWriteTimeUtc(customDatPath);
+    if (cachedTime != 0 && currentTime != 0 && cachedTime != currentTime) {
+        logger.info("cached default wall map ignored because custom.dat has changed since it was recorded");
+        return {};
+    }
+
+    cachedCustomDatWriteTime = cachedTime;
+    return candidate;
+}
+
 bool lockCurrentProcessInstance() {
     char mutexName[128] = {};
     sprintf_s(mutexName, "Local\\wkWall2Wall_%lu", GetCurrentProcessId());
@@ -91,6 +194,17 @@ std::vector<WaOverlayRect> buildMetadataOverlayTestRects(const WallMapMetadata& 
     }
 
     return rects;
+}
+
+WaOverlayMap buildMetadataOverlayMap(const WallMapMetadata& map) {
+    WaOverlayMap overlayMap;
+    overlayMap.name = map.name;
+    overlayMap.fileName = map.fileName;
+    overlayMap.sha256 = map.sha256;
+    overlayMap.width = map.width;
+    overlayMap.height = map.height;
+    overlayMap.rects = buildMetadataOverlayTestRects(map);
+    return overlayMap;
 }
 
 DWORD WINAPI initializeModule(LPVOID) {
@@ -155,16 +269,19 @@ DWORD WINAPI initializeModule(LPVOID) {
         }
 
         std::vector<WaOverlayRect> direct3D9OverlayTestRects;
+        std::vector<WaOverlayMap> direct3D9OverlayMaps;
         WaOverlayTransform direct3D9OverlayTransform;
         if (config.enableDirect3D9MetadataOverlayTest) {
             if (wallMetadata.maps.empty()) {
                 logger.warn("Direct3D9 metadata overlay test enabled, but no wall metadata map is loaded");
             } else {
-                const std::size_t mapIndex = static_cast<std::size_t>(config.direct3D9MetadataOverlayMapIndex);
-                const WallMapMetadata& overlayMap = wallMetadata.maps[mapIndex < wallMetadata.maps.size() ? mapIndex : 0];
-                direct3D9OverlayTestRects = buildMetadataOverlayTestRects(overlayMap);
-                direct3D9OverlayTransform.mapWidth = overlayMap.width;
-                direct3D9OverlayTransform.mapHeight = overlayMap.height;
+                direct3D9OverlayMaps.reserve(wallMetadata.maps.size());
+                for (const WallMapMetadata& map : wallMetadata.maps) {
+                    WaOverlayMap overlayMap = buildMetadataOverlayMap(map);
+                    if (!overlayMap.rects.empty()) {
+                        direct3D9OverlayMaps.push_back(overlayMap);
+                    }
+                }
                 direct3D9OverlayTransform.offsetX = config.direct3D9MetadataOverlayOffsetX;
                 direct3D9OverlayTransform.offsetY = config.direct3D9MetadataOverlayOffsetY;
                 direct3D9OverlayTransform.scalePercent = config.direct3D9MetadataOverlayScalePercent;
@@ -175,13 +292,19 @@ DWORD WINAPI initializeModule(LPVOID) {
                 direct3D9OverlayTransform.cameraSlot = config.direct3D9MetadataOverlayCameraSlot;
                 direct3D9OverlayTransform.trackingTargetOverlayTest = config.enableDirect3D9TrackingTargetOverlayTest;
                 direct3D9OverlayTransform.touchRadiusPixels = config.touchRadiusPixels;
+                direct3D9OverlayTransform.mapCachePath = joinPath(gameDirectory, "wkWall2Wall.cache");
+                direct3D9OverlayTransform.customDatPath = joinPath(gameDirectory, "custom.dat");
+                direct3D9OverlayTransform.cachedMapPath = readCachedMapPath(
+                    direct3D9OverlayTransform.mapCachePath,
+                    direct3D9OverlayTransform.customDatPath,
+                    direct3D9OverlayMaps,
+                    logger,
+                    direct3D9OverlayTransform.cachedMapCustomDatWriteTime);
 
                 std::ostringstream overlayMessage;
                 overlayMessage << "Direct3D9 metadata overlay test prepared "
-                               << direct3D9OverlayTestRects.size()
-                               << " rect(s) from metadata map \""
-                               << overlayMap.name
-                               << "\" using offset "
+                               << direct3D9OverlayMaps.size()
+                               << " metadata map(s) for dynamic activation using offset "
                                << config.direct3D9MetadataOverlayOffsetX
                                << ","
                                << config.direct3D9MetadataOverlayOffsetY
@@ -200,6 +323,10 @@ DWORD WINAPI initializeModule(LPVOID) {
                                << ", trackingTargetOverlay "
                                << (config.enableDirect3D9TrackingTargetOverlayTest ? "true" : "false");
                 logger.info(overlayMessage.str());
+
+                if (!direct3D9OverlayTransform.cachedMapPath.empty()) {
+                    logger.info("cached default wall map candidate: " + direct3D9OverlayTransform.cachedMapPath);
+                }
             }
         }
 
@@ -218,6 +345,7 @@ DWORD WINAPI initializeModule(LPVOID) {
                     config.enableDirect3D9DeviceSlotProbe,
                     config.enableDirect3D9OverlaySmokeTest,
                     direct3D9OverlayTestRects,
+                    direct3D9OverlayMaps,
                     direct3D9OverlayTransform,
                     hookError)) {
                 g_hookManager.reset();

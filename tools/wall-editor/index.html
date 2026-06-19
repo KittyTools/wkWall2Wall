@@ -19,14 +19,10 @@
 
       <section class="panel">
         <h2>1. Load map</h2>
-        <label class="file-button">
-          <input id="mapInput" type="file" accept="image/png,image/jpeg,image/bmp,image/gif,image/webp">
-          Choose map image
-        </label>
-        <label class="file-button secondary">
-          <input id="iniInput" type="file" accept=".ini,.w2w.ini,text/plain">
-          Import existing .w2w.ini
-        </label>
+        <button id="mapButton" type="button" class="file-button">Choose map image</button>
+        <input id="mapInput" class="hidden-file-input" type="file" accept="image/png,image/jpeg,image/bmp,image/gif,image/webp">
+        <button id="iniButton" type="button" class="file-button secondary">Import existing .w2w.ini</button>
+        <input id="iniInput" class="hidden-file-input" type="file" accept=".ini,.w2w.ini,text/plain">
         <div id="mapInfo" class="muted">No map loaded.</div>
       </section>
 
