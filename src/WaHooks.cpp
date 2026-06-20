@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <d3d9.h>
+#include <ddraw.h>
 #include <gl/GL.h>
 
 #include <algorithm>
@@ -65,9 +66,12 @@ constexpr DWORD kActiveWormRefreshIntervalMilliseconds = 50;
 constexpr DWORD kActiveOwnerRecentMotionKeepMilliseconds = 750;
 constexpr DWORD kRecentMotionHandoffMilliseconds = 1500;
 constexpr DWORD kTrackingFallbackTurnResetMinAgeMilliseconds = 1500;
+constexpr DWORD kAggregateOwnerTurnResetMinAgeMilliseconds = 5000;
 constexpr DWORD kGameTimerTransitionResetDebounceMilliseconds = 1000;
 constexpr DWORD kOverlayWormEvidenceKeepMilliseconds = 1000;
 constexpr DWORD kOverlayGameplayGraceMilliseconds = 250;
+constexpr DWORD kDirectDrawSurfaceTransitionDebounceMilliseconds = 750;
+constexpr DWORD kDirectDrawSurfaceTransitionDrawCooldownMilliseconds = 1000;
 constexpr LONG kUnknownWallTouchTurnTeamByte = -1;
 constexpr LONG kFallbackWallTouchTurnOwnerAddress = -2;
 
@@ -237,6 +241,8 @@ using CreateFileWFunction = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_AT
 using LoadLibraryAFunction = HMODULE(WINAPI*)(LPCSTR);
 using GetProcAddressFunction = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 using Direct3DCreate9Function = IDirect3D9*(WINAPI*)(UINT);
+using DirectDrawCreateFunction = HRESULT(WINAPI*)(GUID*, LPDIRECTDRAW*, IUnknown*);
+using DirectDrawCreateExFunction = HRESULT(WINAPI*)(GUID*, LPVOID*, REFIID, IUnknown*);
 using OpenGLEndFunction = void(APIENTRY*)();
 
 GetMessageAFunction g_originalGetMessageA = nullptr;
@@ -248,6 +254,8 @@ CreateFileWFunction g_originalCreateFileW = nullptr;
 LoadLibraryAFunction g_originalLoadLibraryA = nullptr;
 GetProcAddressFunction g_originalGetProcAddress = nullptr;
 Direct3DCreate9Function g_originalDirect3DCreate9 = nullptr;
+DirectDrawCreateFunction g_originalDirectDrawCreate = nullptr;
+DirectDrawCreateExFunction g_originalDirectDrawCreateEx = nullptr;
 OpenGLEndFunction g_originalOpenGLEnd = nullptr;
 Logger* g_runtimeProbeLogger = nullptr;
 volatile LONG g_getMessageProbeHits = 0;
@@ -257,6 +265,20 @@ volatile LONG g_stretchBltProbeHits = 0;
 volatile LONG g_rendererModuleProbeStarted = 0;
 volatile LONG g_rendererApiProbeLoadHits = 0;
 volatile LONG g_rendererApiProbeProcHits = 0;
+volatile LONG g_directDrawCreateProbeHits = 0;
+volatile LONG g_directDrawCreateExProbeHits = 0;
+volatile LONG g_directDrawQueryInterfaceProbeHits = 0;
+volatile LONG g_directDrawCreateSurfaceProbeHits = 0;
+volatile LONG g_directDrawSurfaceBltProbeHits = 0;
+volatile LONG g_directDrawSurfaceBltFastProbeHits = 0;
+volatile LONG g_directDrawSurfaceFlipProbeHits = 0;
+volatile LONG g_directDrawSurfaceUnlockProbeHits = 0;
+volatile LONG g_directDrawOverlayDrawHits = 0;
+volatile LONG g_directDrawOverlayFailureHits = 0;
+volatile LONG g_directDrawOverlayNoDrawHits = 0;
+volatile LONG g_directDrawOverlayDrawing = 0;
+volatile LONG g_directDrawSurfaceTransitionTick = 0;
+volatile LONG g_directDrawSurfaceTransitionLogCount = 0;
 volatile LONG g_openGLEndProbeHits = 0;
 volatile LONG g_cameraTrackingProbeHits = 0;
 volatile LONG g_cameraTrackingPointAddress = 0;
@@ -351,6 +373,10 @@ std::uintptr_t g_waModuleBase = 0;
 
 constexpr GUID kIUnknownGuid = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 constexpr GUID kIDirect3D9Guid = {0x81BDCBCA, 0x64D4, 0x426D, {0xAE, 0x8D, 0xAD, 0x01, 0x47, 0xF4, 0x27, 0x5C}};
+constexpr GUID kIDirectDrawGuid = {0x6C14DB80, 0xA733, 0x11CE, {0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60}};
+constexpr GUID kIDirectDraw2Guid = {0xB3A6F3E0, 0x2B43, 0x11CF, {0xA2, 0xDE, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56}};
+constexpr GUID kIDirectDraw4Guid = {0x9C59509A, 0x39BD, 0x11D1, {0x8C, 0x4A, 0x00, 0xC0, 0x4F, 0xD9, 0x30, 0xC5}};
+constexpr GUID kIDirectDraw7Guid = {0x15E65EC0, 0x3B9C, 0x11D2, {0xB9, 0x2F, 0x00, 0x60, 0x97, 0x97, 0xEA, 0x5B}};
 constexpr std::size_t kD3D9DeviceVtableSize = 119;
 constexpr std::size_t kD3D9DeviceReleaseIndex = 2;
 constexpr std::size_t kD3D9DeviceResetIndex = 16;
@@ -358,6 +384,12 @@ constexpr std::size_t kD3D9DevicePresentIndex = 17;
 constexpr std::size_t kD3D9DeviceBeginSceneIndex = 41;
 constexpr std::size_t kD3D9DeviceEndSceneIndex = 42;
 constexpr bool kEnableUnsafeD3D9DeviceShadowVtableProbe = false;
+constexpr std::size_t kDirectDrawQueryInterfaceIndex = 0;
+constexpr std::size_t kDirectDrawCreateSurfaceIndex = 6;
+constexpr std::size_t kDirectDrawSurfaceBltIndex = 5;
+constexpr std::size_t kDirectDrawSurfaceBltFastIndex = 7;
+constexpr std::size_t kDirectDrawSurfaceFlipIndex = 11;
+constexpr std::size_t kDirectDrawSurfaceUnlockIndex = 32;
 
 using D3D9DeviceReleaseFunction = ULONG(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
 using D3D9DeviceResetFunction = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
@@ -368,6 +400,33 @@ using D3D9DevicePresentFunction = HRESULT(STDMETHODCALLTYPE*)(
     HWND,
     const RGNDATA*);
 using D3D9DeviceEndSceneFunction = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
+using DirectDrawQueryInterfaceFunction = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
+using DirectDrawCreateSurfaceFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirectDraw*,
+    LPDDSURFACEDESC,
+    LPDIRECTDRAWSURFACE*,
+    IUnknown*);
+using DirectDraw7CreateSurfaceFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirectDraw7*,
+    LPDDSURFACEDESC2,
+    LPDIRECTDRAWSURFACE7*,
+    IUnknown*);
+using DirectDrawSurfaceBltFunction = HRESULT(STDMETHODCALLTYPE*)(
+    void*,
+    LPRECT,
+    void*,
+    LPRECT,
+    DWORD,
+    LPDDBLTFX);
+using DirectDrawSurfaceBltFastFunction = HRESULT(STDMETHODCALLTYPE*)(
+    void*,
+    DWORD,
+    DWORD,
+    void*,
+    LPRECT,
+    DWORD);
+using DirectDrawSurfaceFlipFunction = HRESULT(STDMETHODCALLTYPE*)(void*, void*, DWORD);
+using DirectDrawSurfaceUnlockFunction = HRESULT(STDMETHODCALLTYPE*)(void*, void*);
 
 struct Direct3D9DeviceProbeState {
     IDirect3DDevice9* device = nullptr;
@@ -381,6 +440,22 @@ struct Direct3D9DeviceProbeState {
     volatile LONG endSceneHits = 0;
     volatile LONG resetHits = 0;
     volatile LONG releaseHits = 0;
+};
+
+struct DirectDrawObjectVtableHook {
+    std::uintptr_t* vtable = nullptr;
+    bool usesSurfaceDesc2 = false;
+    DirectDrawQueryInterfaceFunction originalQueryInterface = nullptr;
+    DirectDrawCreateSurfaceFunction originalCreateSurface = nullptr;
+    DirectDraw7CreateSurfaceFunction originalCreateSurface7 = nullptr;
+};
+
+struct DirectDrawSurfaceVtableHook {
+    std::uintptr_t* vtable = nullptr;
+    DirectDrawSurfaceBltFunction originalBlt = nullptr;
+    DirectDrawSurfaceBltFastFunction originalBltFast = nullptr;
+    DirectDrawSurfaceFlipFunction originalFlip = nullptr;
+    DirectDrawSurfaceUnlockFunction originalUnlock = nullptr;
 };
 
 struct Direct3D9OverlayRect {
@@ -476,6 +551,9 @@ std::array<CameraTargetCallSample, kCameraTargetCallSampleSlots> g_cameraTargetC
 std::array<WormLiveSample, kWormLiveSampleSlots> g_wormLiveSamples;
 
 Direct3D9DeviceProbeState g_direct3D9DeviceProbe;
+std::mutex g_directDrawProbeMutex;
+std::vector<DirectDrawObjectVtableHook> g_directDrawObjectVtableHooks;
+std::vector<DirectDrawSurfaceVtableHook> g_directDrawSurfaceVtableHooks;
 std::vector<Direct3D9OverlayRect> g_direct3D9OverlayTestRects;
 std::vector<WaOverlayMap> g_direct3D9OverlayMaps;
 WaOverlayTransform g_direct3D9OverlayTransform;
@@ -512,6 +590,33 @@ HRESULT STDMETHODCALLTYPE hookedD3D9DevicePresent(
     HWND destinationWindowOverride,
     const RGNDATA* dirtyRegion) noexcept;
 HRESULT STDMETHODCALLTYPE hookedD3D9DeviceEndScene(IDirect3DDevice9* device) noexcept;
+HRESULT STDMETHODCALLTYPE hookedDirectDrawQueryInterface(void* directDraw, REFIID iid, void** object);
+HRESULT STDMETHODCALLTYPE hookedDirectDrawCreateSurface(
+    IDirectDraw* directDraw,
+    LPDDSURFACEDESC surfaceDescription,
+    LPDIRECTDRAWSURFACE* surface,
+    IUnknown* outer);
+HRESULT STDMETHODCALLTYPE hookedDirectDraw7CreateSurface(
+    IDirectDraw7* directDraw,
+    LPDDSURFACEDESC2 surfaceDescription,
+    LPDIRECTDRAWSURFACE7* surface,
+    IUnknown* outer);
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceBlt(
+    void* surface,
+    LPRECT destinationRect,
+    void* sourceSurface,
+    LPRECT sourceRect,
+    DWORD flags,
+    LPDDBLTFX effects);
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceBltFast(
+    void* surface,
+    DWORD x,
+    DWORD y,
+    void* sourceSurface,
+    LPRECT sourceRect,
+    DWORD flags);
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceFlip(void* surface, void* targetOverride, DWORD flags);
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceUnlock(void* surface, void* surfaceData);
 HANDLE WINAPI hookedCreateFileA(
     LPCSTR fileName,
     DWORD desiredAccess,
@@ -762,6 +867,34 @@ bool sameGuid(REFIID left, const GUID& right) {
     return std::memcmp(&left, &right, sizeof(GUID)) == 0;
 }
 
+bool isDirectDrawInterfaceGuid(REFIID guid) {
+    return sameGuid(guid, kIDirectDrawGuid)
+        || sameGuid(guid, kIDirectDraw2Guid)
+        || sameGuid(guid, kIDirectDraw4Guid)
+        || sameGuid(guid, kIDirectDraw7Guid);
+}
+
+bool directDrawInterfaceUsesSurfaceDesc2(REFIID guid) {
+    return sameGuid(guid, kIDirectDraw4Guid)
+        || sameGuid(guid, kIDirectDraw7Guid);
+}
+
+const char* directDrawInterfaceName(REFIID guid) {
+    if (sameGuid(guid, kIDirectDrawGuid)) {
+        return "IDirectDraw";
+    }
+    if (sameGuid(guid, kIDirectDraw2Guid)) {
+        return "IDirectDraw2";
+    }
+    if (sameGuid(guid, kIDirectDraw4Guid)) {
+        return "IDirectDraw4";
+    }
+    if (sameGuid(guid, kIDirectDraw7Guid)) {
+        return "IDirectDraw7";
+    }
+    return "unknown";
+}
+
 std::string formatHex32(std::uint32_t value) {
     return formatAddress(static_cast<std::uintptr_t>(value));
 }
@@ -973,6 +1106,16 @@ std::size_t resetTouchedOverlayWallsForNewTurn() {
     return resetCount;
 }
 
+std::size_t touchedOverlayWallCount() {
+    std::size_t count = 0;
+    for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        if (rect.touched) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 void rememberWaStateUiAddress(std::uintptr_t stateUiAddress) {
     if (stateUiAddress == 0
         || !isReadableMemoryRange(stateUiAddress + kWaCurrentTeamByteOffset, sizeof(BYTE))) {
@@ -1097,6 +1240,17 @@ void clearActiveWormCandidateForTurnChange() {
     InterlockedExchange(&g_wallTouchLastTouchTick, 0);
 }
 
+void clearActiveWormCoordinateCandidateForReselection() {
+    InterlockedExchange(&g_activeWormCandidateOwnerAddress, 0);
+    InterlockedExchange(&g_activeWormCandidateBaseAddress, 0);
+    InterlockedExchange(&g_activeWormCandidateXOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateYOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateOffsetValid, 0);
+    InterlockedExchange(&g_activeWormCandidateSourceKind, 0);
+    InterlockedExchange(&g_activeWormCandidateSourceOffset, 0);
+    InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
+}
+
 void resetTouchedOverlayWallsWhenActiveTeamChanges() {
     BYTE activeTeamByte = 0;
     if (!currentActiveTeamByteFromKnownWormSamples(activeTeamByte)) {
@@ -1191,6 +1345,20 @@ void resetTouchedOverlayWallsWhenActiveOwnerChanges(std::uintptr_t ownerAddress)
     }
 }
 
+void resetTouchedOverlayWallsWhenAggregateOwnerLooksLikeNewTurn(std::uintptr_t ownerAddress) {
+    if (ownerAddress == 0 || touchedOverlayWallCount() == 0) {
+        return;
+    }
+
+    const DWORD lastTouchTick = static_cast<DWORD>(g_wallTouchLastTouchTick);
+    const DWORD now = GetTickCount();
+    if (lastTouchTick == 0 || now - lastTouchTick < kAggregateOwnerTurnResetMinAgeMilliseconds) {
+        return;
+    }
+
+    resetTouchedOverlayWallsWhenActiveOwnerChanges(ownerAddress);
+}
+
 void rememberFallbackWallTouchTurn() {
     if (g_wallTouchTurnOwnerAddress == 0) {
         InterlockedExchange(&g_wallTouchTurnOwnerAddress, kFallbackWallTouchTurnOwnerAddress);
@@ -1202,6 +1370,22 @@ void rememberFallbackWallTouchTurn() {
     }
 
     InterlockedExchange(&g_wallTouchTurnFallbackTouchTick, static_cast<LONG>(GetTickCount()));
+}
+
+void rememberActiveWallTouchTurn() {
+    if (g_wallTouchTurnOwnerAddress != 0) {
+        return;
+    }
+
+    const LONG ownerAddress = g_activeWormCandidateOwnerAddress;
+    if (ownerAddress != 0) {
+        InterlockedCompareExchange(&g_wallTouchTurnOwnerAddress, ownerAddress, 0);
+    }
+
+    BYTE activeTeamByte = 0;
+    if (currentActiveTeamByteFromKnownWormSamples(activeTeamByte)) {
+        InterlockedExchange(&g_wallTouchTurnTeamByte, static_cast<LONG>(activeTeamByte));
+    }
 }
 
 void publishActiveWormCoordinateCandidate(
@@ -2627,7 +2811,7 @@ void refreshActiveWormCandidateFromTrackingTarget() {
                 return;
             }
 
-            clearActiveWormCandidateForTurnChange();
+            clearActiveWormCoordinateCandidateForReselection();
         }
     }
 
@@ -2678,6 +2862,8 @@ void maybeUpdateActiveWormCoordinateOffsets(void* owner, LONG xFixed, LONG yFixe
         && g_activeWormCandidateSourceKind == 4) {
         return;
     }
+
+    resetTouchedOverlayWallsWhenAggregateOwnerLooksLikeNewTurn(reinterpret_cast<std::uintptr_t>(owner));
 
     const LONG previousOwner = g_activeWormCandidateOwnerAddress;
     if (previousOwner != 0 && previousOwner != static_cast<LONG>(reinterpret_cast<std::uintptr_t>(owner))) {
@@ -5159,6 +5345,8 @@ void updateTouchedOverlayWallsFromActiveWorm() {
         InterlockedExchange(&g_wallTouchLastTouchTick, static_cast<LONG>(GetTickCount()));
         if (usedTrackingFallback) {
             rememberFallbackWallTouchTurn();
+        } else {
+            rememberActiveWallTouchTurn();
         }
 
         if (g_runtimeProbeLogger != nullptr && g_direct3D9WallTouchLogCount < 64) {
@@ -5519,6 +5707,680 @@ bool writeDirect3D9DeviceVtableSlot(std::uintptr_t* vtable, std::size_t index, s
     VirtualProtect(slot, sizeof(*slot), oldProtect, &ignoredProtect);
     FlushInstructionCache(GetCurrentProcess(), slot, sizeof(*slot));
     return true;
+}
+
+DirectDrawObjectVtableHook* directDrawObjectHookForVtable(std::uintptr_t* vtable) {
+    for (DirectDrawObjectVtableHook& hook : g_directDrawObjectVtableHooks) {
+        if (hook.vtable == vtable) {
+            return &hook;
+        }
+    }
+
+    return nullptr;
+}
+
+DirectDrawSurfaceVtableHook* directDrawSurfaceHookForVtable(std::uintptr_t* vtable) {
+    for (DirectDrawSurfaceVtableHook& hook : g_directDrawSurfaceVtableHooks) {
+        if (hook.vtable == vtable) {
+            return &hook;
+        }
+    }
+
+    return nullptr;
+}
+
+DirectDrawObjectVtableHook directDrawObjectHookSnapshot(void* directDraw) {
+    DirectDrawObjectVtableHook snapshot;
+    if (directDraw == nullptr) {
+        return snapshot;
+    }
+
+    auto** objectVtableSlot = reinterpret_cast<std::uintptr_t**>(directDraw);
+    std::uintptr_t* vtable = *objectVtableSlot;
+    std::lock_guard<std::mutex> lock(g_directDrawProbeMutex);
+    if (DirectDrawObjectVtableHook* hook = directDrawObjectHookForVtable(vtable)) {
+        snapshot = *hook;
+    }
+    return snapshot;
+}
+
+DirectDrawSurfaceVtableHook directDrawSurfaceHookSnapshot(void* surface) {
+    DirectDrawSurfaceVtableHook snapshot;
+    if (surface == nullptr) {
+        return snapshot;
+    }
+
+    auto** objectVtableSlot = reinterpret_cast<std::uintptr_t**>(surface);
+    std::uintptr_t* vtable = *objectVtableSlot;
+    std::lock_guard<std::mutex> lock(g_directDrawProbeMutex);
+    if (DirectDrawSurfaceVtableHook* hook = directDrawSurfaceHookForVtable(vtable)) {
+        snapshot = *hook;
+    }
+    return snapshot;
+}
+
+DWORD directDrawMaskComponent(BYTE component, DWORD mask) {
+    if (mask == 0) {
+        return 0;
+    }
+
+    DWORD shiftedMask = mask;
+    DWORD shift = 0;
+    while ((shiftedMask & 1U) == 0U) {
+        shiftedMask >>= 1;
+        ++shift;
+    }
+
+    DWORD maxValue = 0;
+    DWORD bit = 1;
+    while ((shiftedMask & bit) != 0U) {
+        maxValue = (maxValue << 1U) | 1U;
+        bit <<= 1U;
+    }
+
+    if (maxValue == 0) {
+        return 0;
+    }
+
+    const DWORD scaled = (static_cast<DWORD>(component) * maxValue + 127U) / 255U;
+    return (scaled << shift) & mask;
+}
+
+DWORD directDrawFillColorFromArgb(DWORD argb, const DDPIXELFORMAT& pixelFormat) {
+    const BYTE red = static_cast<BYTE>((argb >> 16) & 0xFF);
+    const BYTE green = static_cast<BYTE>((argb >> 8) & 0xFF);
+    const BYTE blue = static_cast<BYTE>(argb & 0xFF);
+
+    if ((pixelFormat.dwFlags & DDPF_RGB) != 0
+        && pixelFormat.dwRGBBitCount != 0
+        && (pixelFormat.dwRBitMask != 0
+            || pixelFormat.dwGBitMask != 0
+            || pixelFormat.dwBBitMask != 0)) {
+        return directDrawMaskComponent(red, pixelFormat.dwRBitMask)
+            | directDrawMaskComponent(green, pixelFormat.dwGBitMask)
+            | directDrawMaskComponent(blue, pixelFormat.dwBBitMask);
+    }
+
+    return argb & 0x00FFFFFFU;
+}
+
+bool directDrawSurfaceLooksLikeContextTransition(DWORD caps, DWORD flags) {
+    if ((caps & DDSCAPS_PRIMARYSURFACE) != 0) {
+        return true;
+    }
+
+    if ((caps & (DDSCAPS_BACKBUFFER | DDSCAPS_FLIP)) != 0) {
+        return true;
+    }
+
+    return (caps & DDSCAPS_OFFSCREENPLAIN) != 0
+        && (flags & (DDSD_WIDTH | DDSD_HEIGHT)) == (DDSD_WIDTH | DDSD_HEIGHT);
+}
+
+void noteDirectDrawSurfaceContextTransition(DWORD caps, DWORD flags, DWORD width, DWORD height, const char* sourceName) {
+    if (!directDrawSurfaceLooksLikeContextTransition(caps, flags)) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    const DWORD previousTick = static_cast<DWORD>(g_directDrawSurfaceTransitionTick);
+    if (previousTick != 0 && now - previousTick < kDirectDrawSurfaceTransitionDebounceMilliseconds) {
+        return;
+    }
+
+    InterlockedExchange(&g_directDrawSurfaceTransitionTick, static_cast<LONG>(now));
+    resetTransientGameplayTrackingState("DirectDraw surface transition", true);
+
+    const LONG logHits = InterlockedIncrement(&g_directDrawSurfaceTransitionLogCount);
+    if (logHits <= 16 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDraw surface transition detected from "
+                << (sourceName != nullptr ? sourceName : "CreateSurface")
+                << ", caps "
+                << formatHex32(caps)
+                << ", flags "
+                << formatHex32(flags);
+        if ((flags & (DDSD_WIDTH | DDSD_HEIGHT)) == (DDSD_WIDTH | DDSD_HEIGHT)) {
+            message << ", size " << width << "x" << height;
+        }
+        g_runtimeProbeLogger->info(message.str());
+    }
+}
+
+bool directDrawSurfaceTransitionCooldownActive() {
+    const DWORD transitionTick = static_cast<DWORD>(g_directDrawSurfaceTransitionTick);
+    if (transitionTick == 0) {
+        return false;
+    }
+
+    return GetTickCount() - transitionTick < kDirectDrawSurfaceTransitionDrawCooldownMilliseconds;
+}
+
+void drawDirectDrawOverlayTestRects(
+    void* surface,
+    const DirectDrawSurfaceVtableHook& hook,
+    const char* triggerName) {
+    if (surface == nullptr || hook.originalBlt == nullptr) {
+        return;
+    }
+
+    if (directDrawSurfaceTransitionCooldownActive()) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_directDrawOverlayDrawing, 1, 0) != 0) {
+        return;
+    }
+
+    auto* directDrawSurface = reinterpret_cast<IDirectDrawSurface*>(surface);
+    DDSURFACEDESC surfaceDescription = {};
+    surfaceDescription.dwSize = sizeof(surfaceDescription);
+    HRESULT result = directDrawSurface->GetSurfaceDesc(&surfaceDescription);
+    if (FAILED(result) || surfaceDescription.dwWidth == 0 || surfaceDescription.dwHeight == 0) {
+        const LONG failures = InterlockedIncrement(&g_directDrawOverlayFailureHits);
+        if (failures == 1 && g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: DirectDraw metadata overlay GetSurfaceDesc failed after "
+                    << (triggerName != nullptr ? triggerName : "surface update")
+                    << " with HRESULT "
+                    << formatHex32(static_cast<std::uint32_t>(result));
+            g_runtimeProbeLogger->warn(message.str());
+        }
+        InterlockedExchange(&g_directDrawOverlayDrawing, 0);
+        return;
+    }
+
+    const LONG width = static_cast<LONG>(surfaceDescription.dwWidth);
+    const LONG height = static_cast<LONG>(surfaceDescription.dwHeight);
+
+    std::vector<ScreenOverlayRect> screenRects;
+    const bool prepared = prepareMetadataOverlayScreenRects(
+        "DirectDraw",
+        static_cast<UINT>(width),
+        static_cast<UINT>(height),
+        screenRects);
+
+    std::size_t drawn = 0;
+    std::size_t attempted = 0;
+    HRESULT firstFailure = S_OK;
+    if (prepared) {
+        for (const ScreenOverlayRect& rect : screenRects) {
+            RECT target{
+                std::clamp<LONG>(rect.left, 0, width),
+                std::clamp<LONG>(rect.top, 0, height),
+                std::clamp<LONG>(rect.right, 0, width),
+                std::clamp<LONG>(rect.bottom, 0, height),
+            };
+            if (target.right <= target.left || target.bottom <= target.top) {
+                continue;
+            }
+
+            ++attempted;
+            DDBLTFX effects = {};
+            effects.dwSize = sizeof(effects);
+            effects.dwFillColor = directDrawFillColorFromArgb(rect.color, surfaceDescription.ddpfPixelFormat);
+            result = hook.originalBlt(
+                surface,
+                &target,
+                nullptr,
+                nullptr,
+                DDBLT_COLORFILL | DDBLT_WAIT,
+                &effects);
+            if (SUCCEEDED(result)) {
+                ++drawn;
+            } else if (SUCCEEDED(firstFailure)) {
+                firstFailure = result;
+            }
+        }
+    }
+
+    InterlockedExchange(&g_directDrawOverlayDrawing, 0);
+
+    if (drawn > 0) {
+        const LONG hits = InterlockedIncrement(&g_directDrawOverlayDrawHits);
+        if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: DirectDraw metadata overlay drew "
+                    << drawn
+                    << " rect(s) after "
+                    << (triggerName != nullptr ? triggerName : "surface update")
+                    << " on surface "
+                    << formatAddress(reinterpret_cast<std::uintptr_t>(surface))
+                    << ", caps "
+                    << formatHex32(surfaceDescription.ddsCaps.dwCaps)
+                    << ", size "
+                    << width
+                    << "x"
+                    << height;
+            g_runtimeProbeLogger->info(message.str());
+        }
+    } else if (prepared) {
+        const LONG noDrawHits = InterlockedIncrement(&g_directDrawOverlayNoDrawHits);
+        if (noDrawHits <= 4 && g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: DirectDraw metadata overlay prepared "
+                    << screenRects.size()
+                    << " rect(s) after "
+                    << (triggerName != nullptr ? triggerName : "surface update")
+                    << " but drew none; attempted "
+                    << attempted
+                    << " on surface "
+                    << formatAddress(reinterpret_cast<std::uintptr_t>(surface))
+                    << " size "
+                    << width
+                    << "x"
+                    << height;
+            g_runtimeProbeLogger->info(message.str());
+        }
+    } else if (FAILED(firstFailure)) {
+        const LONG failures = InterlockedIncrement(&g_directDrawOverlayFailureHits);
+        if (failures == 1 && g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: DirectDraw metadata overlay color fill failed after "
+                    << (triggerName != nullptr ? triggerName : "surface update")
+                    << " with HRESULT "
+                    << formatHex32(static_cast<std::uint32_t>(firstFailure));
+            g_runtimeProbeLogger->warn(message.str());
+        }
+    }
+}
+
+bool installDirectDrawSurfaceProbe(void* surface) {
+    if (surface == nullptr) {
+        return false;
+    }
+
+    auto** objectVtableSlot = reinterpret_cast<std::uintptr_t**>(surface);
+    std::uintptr_t* vtable = *objectVtableSlot;
+    if (vtable == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_directDrawProbeMutex);
+    if (directDrawSurfaceHookForVtable(vtable) != nullptr) {
+        return true;
+    }
+
+    DirectDrawSurfaceVtableHook hook;
+    hook.vtable = vtable;
+    hook.originalBlt = reinterpret_cast<DirectDrawSurfaceBltFunction>(vtable[kDirectDrawSurfaceBltIndex]);
+    hook.originalBltFast = reinterpret_cast<DirectDrawSurfaceBltFastFunction>(vtable[kDirectDrawSurfaceBltFastIndex]);
+    hook.originalFlip = reinterpret_cast<DirectDrawSurfaceFlipFunction>(vtable[kDirectDrawSurfaceFlipIndex]);
+    hook.originalUnlock = reinterpret_cast<DirectDrawSurfaceUnlockFunction>(vtable[kDirectDrawSurfaceUnlockIndex]);
+
+    const bool bltPatched = writeDirect3D9DeviceVtableSlot(
+        vtable,
+        kDirectDrawSurfaceBltIndex,
+        reinterpret_cast<std::uintptr_t>(&hookedDirectDrawSurfaceBlt));
+    const bool bltFastPatched = bltPatched && writeDirect3D9DeviceVtableSlot(
+        vtable,
+        kDirectDrawSurfaceBltFastIndex,
+        reinterpret_cast<std::uintptr_t>(&hookedDirectDrawSurfaceBltFast));
+    const bool flipPatched = bltFastPatched && writeDirect3D9DeviceVtableSlot(
+        vtable,
+        kDirectDrawSurfaceFlipIndex,
+        reinterpret_cast<std::uintptr_t>(&hookedDirectDrawSurfaceFlip));
+    const bool unlockPatched = flipPatched && writeDirect3D9DeviceVtableSlot(
+        vtable,
+        kDirectDrawSurfaceUnlockIndex,
+        reinterpret_cast<std::uintptr_t>(&hookedDirectDrawSurfaceUnlock));
+    if (!unlockPatched) {
+        if (flipPatched) {
+            writeDirect3D9DeviceVtableSlot(
+                vtable,
+                kDirectDrawSurfaceFlipIndex,
+                reinterpret_cast<std::uintptr_t>(hook.originalFlip));
+        }
+        if (bltFastPatched) {
+            writeDirect3D9DeviceVtableSlot(
+                vtable,
+                kDirectDrawSurfaceBltFastIndex,
+                reinterpret_cast<std::uintptr_t>(hook.originalBltFast));
+        }
+        if (bltPatched) {
+            writeDirect3D9DeviceVtableSlot(
+                vtable,
+                kDirectDrawSurfaceBltIndex,
+                reinterpret_cast<std::uintptr_t>(hook.originalBlt));
+        }
+        return false;
+    }
+
+    g_directDrawSurfaceVtableHooks.push_back(hook);
+    if (g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDraw surface vtable probe installed for surface "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(surface))
+                << ", vtable "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(vtable));
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return true;
+}
+
+bool installDirectDrawObjectProbe(void* directDraw, bool usesSurfaceDesc2) {
+    if (directDraw == nullptr) {
+        return false;
+    }
+
+    auto** objectVtableSlot = reinterpret_cast<std::uintptr_t**>(directDraw);
+    std::uintptr_t* vtable = *objectVtableSlot;
+    if (vtable == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_directDrawProbeMutex);
+    if (directDrawObjectHookForVtable(vtable) != nullptr) {
+        return true;
+    }
+
+    DirectDrawObjectVtableHook hook;
+    hook.vtable = vtable;
+    hook.usesSurfaceDesc2 = usesSurfaceDesc2;
+    hook.originalQueryInterface =
+        reinterpret_cast<DirectDrawQueryInterfaceFunction>(vtable[kDirectDrawQueryInterfaceIndex]);
+    if (usesSurfaceDesc2) {
+        hook.originalCreateSurface =
+            reinterpret_cast<DirectDrawCreateSurfaceFunction>(vtable[kDirectDrawCreateSurfaceIndex]);
+        hook.originalCreateSurface7 =
+            reinterpret_cast<DirectDraw7CreateSurfaceFunction>(vtable[kDirectDrawCreateSurfaceIndex]);
+    } else {
+        hook.originalCreateSurface =
+            reinterpret_cast<DirectDrawCreateSurfaceFunction>(vtable[kDirectDrawCreateSurfaceIndex]);
+    }
+
+    const bool queryPatched = writeDirect3D9DeviceVtableSlot(
+        vtable,
+        kDirectDrawQueryInterfaceIndex,
+        reinterpret_cast<std::uintptr_t>(&hookedDirectDrawQueryInterface));
+    const bool createSurfacePatched = queryPatched && writeDirect3D9DeviceVtableSlot(
+        vtable,
+        kDirectDrawCreateSurfaceIndex,
+        usesSurfaceDesc2
+            ? reinterpret_cast<std::uintptr_t>(&hookedDirectDraw7CreateSurface)
+            : reinterpret_cast<std::uintptr_t>(&hookedDirectDrawCreateSurface));
+    if (!createSurfacePatched) {
+        if (queryPatched) {
+            writeDirect3D9DeviceVtableSlot(
+                vtable,
+                kDirectDrawQueryInterfaceIndex,
+                reinterpret_cast<std::uintptr_t>(hook.originalQueryInterface));
+        }
+        return false;
+    }
+
+    g_directDrawObjectVtableHooks.push_back(hook);
+    if (g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDraw object vtable probe installed for object "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(directDraw))
+                << ", vtable "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(vtable))
+                << ", desc "
+                << (usesSurfaceDesc2 ? "DDSURFACEDESC2" : "DDSURFACEDESC");
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return true;
+}
+
+HRESULT STDMETHODCALLTYPE hookedDirectDrawQueryInterface(void* directDraw, REFIID iid, void** object) {
+    DirectDrawObjectVtableHook hook = directDrawObjectHookSnapshot(directDraw);
+    if (hook.originalQueryInterface == nullptr) {
+        return E_NOINTERFACE;
+    }
+
+    HRESULT result = hook.originalQueryInterface(directDraw, iid, object);
+    if (SUCCEEDED(result) && object != nullptr && *object != nullptr && isDirectDrawInterfaceGuid(iid)) {
+        installDirectDrawObjectProbe(*object, directDrawInterfaceUsesSurfaceDesc2(iid));
+    }
+
+    const LONG hits = InterlockedIncrement(&g_directDrawQueryInterfaceProbeHits);
+    if (hits <= 16 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDraw::QueryInterface("
+                << directDrawInterfaceName(iid)
+                << ") returned HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", object "
+                << (object != nullptr ? formatAddress(reinterpret_cast<std::uintptr_t>(*object)) : "null");
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hookedDirectDrawCreateSurface(
+    IDirectDraw* directDraw,
+    LPDDSURFACEDESC surfaceDescription,
+    LPDIRECTDRAWSURFACE* surface,
+    IUnknown* outer) {
+    DirectDrawObjectVtableHook hook = directDrawObjectHookSnapshot(directDraw);
+    if (hook.originalCreateSurface == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    const LONG hits = InterlockedIncrement(&g_directDrawCreateSurfaceProbeHits);
+    HRESULT result = hook.originalCreateSurface(directDraw, surfaceDescription, surface, outer);
+    if (SUCCEEDED(result) && surface != nullptr && *surface != nullptr) {
+        installDirectDrawSurfaceProbe(*surface);
+        if (surfaceDescription != nullptr) {
+            const DWORD flags = surfaceDescription->dwFlags;
+            const DWORD width = (flags & DDSD_WIDTH) != 0 ? surfaceDescription->dwWidth : 0;
+            const DWORD height = (flags & DDSD_HEIGHT) != 0 ? surfaceDescription->dwHeight : 0;
+            noteDirectDrawSurfaceContextTransition(
+                surfaceDescription->ddsCaps.dwCaps,
+                flags,
+                width,
+                height,
+                "IDirectDraw::CreateSurface");
+        }
+    }
+
+    if (hits <= 8 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: IDirectDraw::CreateSurface hook fired with HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", surface "
+                << (surface != nullptr ? formatAddress(reinterpret_cast<std::uintptr_t>(*surface)) : "null");
+        if (surfaceDescription != nullptr) {
+            message << ", flags " << formatHex32(surfaceDescription->dwFlags)
+                    << ", caps " << formatHex32(surfaceDescription->ddsCaps.dwCaps);
+            if ((surfaceDescription->dwFlags & DDSD_WIDTH) != 0
+                && (surfaceDescription->dwFlags & DDSD_HEIGHT) != 0) {
+                message << ", size "
+                        << surfaceDescription->dwWidth
+                        << "x"
+                        << surfaceDescription->dwHeight;
+            }
+        }
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hookedDirectDraw7CreateSurface(
+    IDirectDraw7* directDraw,
+    LPDDSURFACEDESC2 surfaceDescription,
+    LPDIRECTDRAWSURFACE7* surface,
+    IUnknown* outer) {
+    DirectDrawObjectVtableHook hook = directDrawObjectHookSnapshot(directDraw);
+    if (hook.originalCreateSurface7 == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    const LONG hits = InterlockedIncrement(&g_directDrawCreateSurfaceProbeHits);
+    HRESULT result = hook.originalCreateSurface7(directDraw, surfaceDescription, surface, outer);
+    if (SUCCEEDED(result) && surface != nullptr && *surface != nullptr) {
+        installDirectDrawSurfaceProbe(*surface);
+        if (surfaceDescription != nullptr) {
+            const DWORD flags = surfaceDescription->dwFlags;
+            const DWORD width = (flags & DDSD_WIDTH) != 0 ? surfaceDescription->dwWidth : 0;
+            const DWORD height = (flags & DDSD_HEIGHT) != 0 ? surfaceDescription->dwHeight : 0;
+            noteDirectDrawSurfaceContextTransition(
+                surfaceDescription->ddsCaps.dwCaps,
+                flags,
+                width,
+                height,
+                "IDirectDraw7::CreateSurface");
+        }
+    }
+
+    if (hits <= 8 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: IDirectDraw7::CreateSurface hook fired with HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", surface "
+                << (surface != nullptr ? formatAddress(reinterpret_cast<std::uintptr_t>(*surface)) : "null");
+        if (surfaceDescription != nullptr) {
+            message << ", flags " << formatHex32(surfaceDescription->dwFlags)
+                    << ", caps " << formatHex32(surfaceDescription->ddsCaps.dwCaps);
+            if ((surfaceDescription->dwFlags & DDSD_WIDTH) != 0
+                && (surfaceDescription->dwFlags & DDSD_HEIGHT) != 0) {
+                message << ", size "
+                        << surfaceDescription->dwWidth
+                        << "x"
+                        << surfaceDescription->dwHeight;
+            }
+        }
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceBlt(
+    void* surface,
+    LPRECT destinationRect,
+    void* sourceSurface,
+    LPRECT sourceRect,
+    DWORD flags,
+    LPDDBLTFX effects) {
+    DirectDrawSurfaceVtableHook hook = directDrawSurfaceHookSnapshot(surface);
+    if (hook.originalBlt == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    HRESULT result = hook.originalBlt(surface, destinationRect, sourceSurface, sourceRect, flags, effects);
+    const LONG hits = InterlockedIncrement(&g_directDrawSurfaceBltProbeHits);
+    if (SUCCEEDED(result)) {
+        drawDirectDrawOverlayTestRects(surface, hook, "Blt");
+    }
+
+    if (hits <= 4 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDrawSurface::Blt hook fired with HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", flags "
+                << formatHex32(flags);
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceBltFast(
+    void* surface,
+    DWORD x,
+    DWORD y,
+    void* sourceSurface,
+    LPRECT sourceRect,
+    DWORD flags) {
+    DirectDrawSurfaceVtableHook hook = directDrawSurfaceHookSnapshot(surface);
+    if (hook.originalBltFast == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    HRESULT result = hook.originalBltFast(surface, x, y, sourceSurface, sourceRect, flags);
+    const LONG hits = InterlockedIncrement(&g_directDrawSurfaceBltFastProbeHits);
+    if (SUCCEEDED(result)) {
+        drawDirectDrawOverlayTestRects(surface, hook, "BltFast");
+    }
+
+    if (hits <= 8 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDrawSurface::BltFast hook fired with HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", destination "
+                << x
+                << ","
+                << y
+                << ", source "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(sourceSurface))
+                << ", flags "
+                << formatHex32(flags);
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceFlip(void* surface, void* targetOverride, DWORD flags) {
+    DirectDrawSurfaceVtableHook hook = directDrawSurfaceHookSnapshot(surface);
+    if (hook.originalFlip == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    HRESULT result = hook.originalFlip(surface, targetOverride, flags);
+    const LONG hits = InterlockedIncrement(&g_directDrawSurfaceFlipProbeHits);
+    if (SUCCEEDED(result)) {
+        drawDirectDrawOverlayTestRects(surface, hook, "Flip");
+    }
+
+    if (hits <= 4 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDrawSurface::Flip hook fired with HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", flags "
+                << formatHex32(flags);
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceUnlock(void* surface, void* surfaceData) {
+    DirectDrawSurfaceVtableHook hook = directDrawSurfaceHookSnapshot(surface);
+    if (hook.originalUnlock == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    HRESULT result = hook.originalUnlock(surface, surfaceData);
+    const LONG hits = InterlockedIncrement(&g_directDrawSurfaceUnlockProbeHits);
+    if (SUCCEEDED(result)) {
+        drawDirectDrawOverlayTestRects(surface, hook, "Unlock");
+    }
+
+    if (hits <= 16 && g_runtimeProbeLogger != nullptr) {
+        DDSURFACEDESC surfaceDescription = {};
+        surfaceDescription.dwSize = sizeof(surfaceDescription);
+        HRESULT descriptionResult = E_FAIL;
+        if (surface != nullptr) {
+            auto* directDrawSurface = reinterpret_cast<IDirectDrawSurface*>(surface);
+            descriptionResult = directDrawSurface->GetSurfaceDesc(&surfaceDescription);
+        }
+
+        std::ostringstream message;
+        message << "runtime probe: DirectDrawSurface::Unlock hook fired with HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", surface "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(surface))
+                << ", data "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(surfaceData));
+        if (SUCCEEDED(descriptionResult)) {
+            message << ", caps "
+                    << formatHex32(surfaceDescription.ddsCaps.dwCaps)
+                    << ", size "
+                    << surfaceDescription.dwWidth
+                    << "x"
+                    << surfaceDescription.dwHeight;
+        }
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
 }
 
 bool installDirect3D9DeviceProbe(IDirect3DDevice9* device) {
@@ -6307,8 +7169,78 @@ IDirect3D9* WINAPI hookedDirect3DCreate9(UINT sdkVersion) {
     return proxy;
 }
 
+HRESULT WINAPI hookedDirectDrawCreate(GUID* guid, LPDIRECTDRAW* directDraw, IUnknown* outer) {
+    const LONG hits = InterlockedIncrement(&g_directDrawCreateProbeHits);
+    if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+        g_runtimeProbeLogger->info("runtime probe: DirectDrawCreate hook fired");
+    }
+
+    if (g_originalDirectDrawCreate == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    HRESULT result = g_originalDirectDrawCreate(guid, directDraw, outer);
+    if (SUCCEEDED(result) && directDraw != nullptr && *directDraw != nullptr) {
+        installDirectDrawObjectProbe(*directDraw, false);
+    }
+
+    if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDrawCreate returned HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", object "
+                << (directDraw != nullptr ? formatAddress(reinterpret_cast<std::uintptr_t>(*directDraw)) : "null");
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
+HRESULT WINAPI hookedDirectDrawCreateEx(GUID* guid, LPVOID* directDraw, REFIID iid, IUnknown* outer) {
+    const LONG hits = InterlockedIncrement(&g_directDrawCreateExProbeHits);
+    if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+        g_runtimeProbeLogger->info("runtime probe: DirectDrawCreateEx hook fired");
+    }
+
+    if (g_originalDirectDrawCreateEx == nullptr) {
+        return DDERR_GENERIC;
+    }
+
+    HRESULT result = g_originalDirectDrawCreateEx(guid, directDraw, iid, outer);
+    if (SUCCEEDED(result) && directDraw != nullptr && *directDraw != nullptr) {
+        installDirectDrawObjectProbe(*directDraw, directDrawInterfaceUsesSurfaceDesc2(iid));
+    }
+
+    if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: DirectDrawCreateEx returned HRESULT "
+                << formatHex32(static_cast<std::uint32_t>(result))
+                << ", object "
+                << (directDraw != nullptr ? formatAddress(reinterpret_cast<std::uintptr_t>(*directDraw)) : "null");
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return result;
+}
+
 FARPROC direct3DCreate9DetourAsFarproc() {
     Direct3DCreate9Function detour = &hookedDirect3DCreate9;
+    FARPROC result = nullptr;
+    static_assert(sizeof(result) == sizeof(detour));
+    std::memcpy(&result, &detour, sizeof(result));
+    return result;
+}
+
+FARPROC directDrawCreateDetourAsFarproc() {
+    DirectDrawCreateFunction detour = &hookedDirectDrawCreate;
+    FARPROC result = nullptr;
+    static_assert(sizeof(result) == sizeof(detour));
+    std::memcpy(&result, &detour, sizeof(result));
+    return result;
+}
+
+FARPROC directDrawCreateExDetourAsFarproc() {
+    DirectDrawCreateExFunction detour = &hookedDirectDrawCreateEx;
     FARPROC result = nullptr;
     static_assert(sizeof(result) == sizeof(detour));
     std::memcpy(&result, &detour, sizeof(result));
@@ -6369,6 +7301,30 @@ FARPROC WINAPI hookedGetProcAddress(HMODULE module, LPCSTR procName) {
             g_runtimeProbeLogger->info(message.str());
         }
         return direct3DCreate9DetourAsFarproc();
+    }
+
+    if (proc != nullptr && isNamedProc(procName, "DirectDrawCreate")) {
+        g_originalDirectDrawCreate = reinterpret_cast<DirectDrawCreateFunction>(proc);
+        InterlockedExchange(&g_directDrawCreateProbeHits, 0);
+        if (g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: replacing GetProcAddress DirectDrawCreate result with detour "
+                    << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedDirectDrawCreate));
+            g_runtimeProbeLogger->info(message.str());
+        }
+        return directDrawCreateDetourAsFarproc();
+    }
+
+    if (proc != nullptr && isNamedProc(procName, "DirectDrawCreateEx")) {
+        g_originalDirectDrawCreateEx = reinterpret_cast<DirectDrawCreateExFunction>(proc);
+        InterlockedExchange(&g_directDrawCreateExProbeHits, 0);
+        if (g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: replacing GetProcAddress DirectDrawCreateEx result with detour "
+                    << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedDirectDrawCreateEx));
+            g_runtimeProbeLogger->info(message.str());
+        }
+        return directDrawCreateExDetourAsFarproc();
     }
 
     if (proc != nullptr && isNamedProc(procName, "glEnd")) {
@@ -6759,6 +7715,20 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_cameraRenderYFixed, 0);
     InterlockedExchange(&g_cameraRenderSampleValid, 0);
     InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
+    InterlockedExchange(&g_directDrawCreateProbeHits, 0);
+    InterlockedExchange(&g_directDrawCreateExProbeHits, 0);
+    InterlockedExchange(&g_directDrawQueryInterfaceProbeHits, 0);
+    InterlockedExchange(&g_directDrawCreateSurfaceProbeHits, 0);
+    InterlockedExchange(&g_directDrawSurfaceBltProbeHits, 0);
+    InterlockedExchange(&g_directDrawSurfaceBltFastProbeHits, 0);
+    InterlockedExchange(&g_directDrawSurfaceFlipProbeHits, 0);
+    InterlockedExchange(&g_directDrawSurfaceUnlockProbeHits, 0);
+    InterlockedExchange(&g_directDrawOverlayDrawHits, 0);
+    InterlockedExchange(&g_directDrawOverlayFailureHits, 0);
+    InterlockedExchange(&g_directDrawOverlayNoDrawHits, 0);
+    InterlockedExchange(&g_directDrawOverlayDrawing, 0);
+    InterlockedExchange(&g_directDrawSurfaceTransitionTick, 0);
+    InterlockedExchange(&g_directDrawSurfaceTransitionLogCount, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayDrawHits, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayFailureHits, 0);
     InterlockedExchange(&g_openGLMetadataOverlayDrawHits, 0);
@@ -6799,6 +7769,11 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
     InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
     InterlockedExchange(&g_direct3D9OverlayGameplayLogCount, 0);
+    {
+        std::lock_guard<std::mutex> lock(g_directDrawProbeMutex);
+        g_directDrawObjectVtableHooks.clear();
+        g_directDrawSurfaceVtableHooks.clear();
+    }
     {
         std::lock_guard<std::mutex> lock(g_detectedMapMutex);
         g_detectedMapPath.clear();

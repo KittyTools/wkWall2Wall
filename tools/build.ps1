@@ -45,6 +45,8 @@ $arguments = @(
 ) + $sources + @(
     "-o",
     $dllPath,
+    "-lddraw",
+    "-lgdi32",
     "-lopengl32",
     "-lversion",
     "-static",
