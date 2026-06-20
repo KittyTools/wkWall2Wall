@@ -45,6 +45,7 @@ $arguments = @(
 ) + $sources + @(
     "-o",
     $dllPath,
+    "-lopengl32",
     "-lversion",
     "-static",
     "-Wl,--exclude-all-symbols"

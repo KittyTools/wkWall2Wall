@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <d3d9.h>
+#include <gl/GL.h>
 
 #include <algorithm>
 #include <array>
@@ -65,6 +66,8 @@ constexpr DWORD kActiveOwnerRecentMotionKeepMilliseconds = 750;
 constexpr DWORD kRecentMotionHandoffMilliseconds = 1500;
 constexpr DWORD kTrackingFallbackTurnResetMinAgeMilliseconds = 1500;
 constexpr DWORD kGameTimerTransitionResetDebounceMilliseconds = 1000;
+constexpr DWORD kOverlayWormEvidenceKeepMilliseconds = 1000;
+constexpr DWORD kOverlayGameplayGraceMilliseconds = 250;
 constexpr LONG kUnknownWallTouchTurnTeamByte = -1;
 constexpr LONG kFallbackWallTouchTurnOwnerAddress = -2;
 
@@ -234,6 +237,7 @@ using CreateFileWFunction = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_AT
 using LoadLibraryAFunction = HMODULE(WINAPI*)(LPCSTR);
 using GetProcAddressFunction = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 using Direct3DCreate9Function = IDirect3D9*(WINAPI*)(UINT);
+using OpenGLEndFunction = void(APIENTRY*)();
 
 GetMessageAFunction g_originalGetMessageA = nullptr;
 SwapBuffersFunction g_originalSwapBuffers = nullptr;
@@ -244,6 +248,7 @@ CreateFileWFunction g_originalCreateFileW = nullptr;
 LoadLibraryAFunction g_originalLoadLibraryA = nullptr;
 GetProcAddressFunction g_originalGetProcAddress = nullptr;
 Direct3DCreate9Function g_originalDirect3DCreate9 = nullptr;
+OpenGLEndFunction g_originalOpenGLEnd = nullptr;
 Logger* g_runtimeProbeLogger = nullptr;
 volatile LONG g_getMessageProbeHits = 0;
 volatile LONG g_swapBuffersProbeHits = 0;
@@ -252,6 +257,7 @@ volatile LONG g_stretchBltProbeHits = 0;
 volatile LONG g_rendererModuleProbeStarted = 0;
 volatile LONG g_rendererApiProbeLoadHits = 0;
 volatile LONG g_rendererApiProbeProcHits = 0;
+volatile LONG g_openGLEndProbeHits = 0;
 volatile LONG g_cameraTrackingProbeHits = 0;
 volatile LONG g_cameraTrackingPointAddress = 0;
 volatile LONG g_cameraTrackingXFixed = 0;
@@ -273,6 +279,9 @@ volatile LONG g_direct3D9OverlaySmokeDrawHits = 0;
 volatile LONG g_direct3D9OverlaySmokeFailureHits = 0;
 volatile LONG g_direct3D9MetadataOverlayDrawHits = 0;
 volatile LONG g_direct3D9MetadataOverlayFailureHits = 0;
+volatile LONG g_openGLMetadataOverlayDrawHits = 0;
+volatile LONG g_openGLMetadataOverlayFailureHits = 0;
+volatile LONG g_openGLMetadataOverlayContextLogHits = 0;
 volatile LONG g_direct3D9MetadataOverlayTransformLogHits = 0;
 volatile LONG g_direct3D9MetadataOverlayLastBackBufferWidth = 0;
 volatile LONG g_direct3D9MetadataOverlayLastBackBufferHeight = 0;
@@ -330,6 +339,7 @@ volatile LONG g_gameTimerTransitionProbeHits = 0;
 volatile LONG g_gameTimerTransitionLogCount = 0;
 volatile LONG g_gameTimerTransitionStateAddress = 0;
 volatile LONG g_gameTimerTransitionLastState = -1;
+volatile LONG g_direct3D9OverlayLastGameplayEvidenceTick = 0;
 bool g_direct3D9ProbeEnabled = false;
 bool g_direct3D9DeviceSlotProbeEnabled = false;
 bool g_direct3D9OverlaySmokeTestEnabled = false;
@@ -382,6 +392,14 @@ struct Direct3D9OverlayRect {
     D3DCOLOR touchedColor = 0;
     std::size_t wallIndex = 0;
     bool touched = false;
+};
+
+struct ScreenOverlayRect {
+    LONG left = 0;
+    LONG top = 0;
+    LONG right = 0;
+    LONG bottom = 0;
+    DWORD color = 0;
 };
 
 struct CameraTrackingSnapshot {
@@ -1375,6 +1393,7 @@ void resetTransientGameplayTrackingState(const char* reason, bool clearWormSampl
     InterlockedExchange(&g_wormMotionCandidateProbeLogCount, 0);
     InterlockedExchange(&g_wormMotionCandidateLastOwnerAddress, 0);
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
+    InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
 
     for (WormLiveSample& sample : g_wormLiveSamples) {
         if (clearWormSamples) {
@@ -4141,6 +4160,7 @@ void clearDirect3D9OverlayMap(const char* reason) {
     g_direct3D9OverlayTransform.mapHeight = 0;
     InterlockedExchange(&g_direct3D9ActiveOverlayMapIndex, -1);
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
+    InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
     resetTransientGameplayTrackingState("overlay map deactivation", true);
 
     if (g_runtimeProbeLogger != nullptr && g_direct3D9OverlayActivationLogCount < 32) {
@@ -4177,6 +4197,7 @@ void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detect
     g_direct3D9OverlayTransform.mapHeight = map.height;
     InterlockedExchange(&g_direct3D9ActiveOverlayMapIndex, static_cast<LONG>(mapIndex));
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
+    InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
     resetTransientGameplayTrackingState("overlay map activation", true);
 
     if (g_runtimeProbeLogger != nullptr && g_direct3D9OverlayActivationLogCount < 32) {
@@ -4327,12 +4348,29 @@ void syncDirect3D9OverlayMapFromDetectedFile() {
     InterlockedExchange(&g_consumedMapSequence, detectedSequence);
 }
 
+bool metadataOverlayCameraWithinMapBounds(const CameraTrackingSnapshot& camera) {
+    if (!camera.available) {
+        return false;
+    }
+
+    const int mapWidth = g_direct3D9OverlayTransform.mapWidth;
+    const int mapHeight = g_direct3D9OverlayTransform.mapHeight;
+    if (mapWidth <= 0 || mapHeight <= 0) {
+        return true;
+    }
+
+    return camera.xPixels >= -128
+        && camera.xPixels <= mapWidth + 128
+        && camera.yPixels >= -128
+        && camera.yPixels <= mapHeight + 128;
+}
+
 bool direct3D9OverlayHasRecentGameplayEvidence() {
     const DWORD now = GetTickCount();
 
     if (g_direct3D9OverlayTransform.cameraFollow) {
         const CameraTrackingSnapshot camera = currentCameraTrackingSnapshot(g_direct3D9OverlayTransform.cameraSlot);
-        if (camera.available) {
+        if (metadataOverlayCameraWithinMapBounds(camera)) {
             return true;
         }
     }
@@ -4344,7 +4382,7 @@ bool direct3D9OverlayHasRecentGameplayEvidence() {
 
         const DWORD sampleTick = static_cast<DWORD>(
             sample.lastPollTick != 0 ? sample.lastPollTick : sample.tick);
-        if (sampleTick != 0 && now - sampleTick <= 5000) {
+        if (sampleTick != 0 && now - sampleTick <= kOverlayWormEvidenceKeepMilliseconds) {
             return true;
         }
     }
@@ -4353,17 +4391,21 @@ bool direct3D9OverlayHasRecentGameplayEvidence() {
 }
 
 bool direct3D9OverlayGameplayReady() {
+    const DWORD now = GetTickCount();
     const bool ready = direct3D9OverlayHasRecentGameplayEvidence();
-    const LONG previous = InterlockedExchange(&g_direct3D9OverlayGameplayActive, ready ? 1 : 0);
     if (ready) {
-        return true;
-    }
-
-    if (previous != 0) {
+        InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, static_cast<LONG>(now));
         InterlockedExchange(&g_direct3D9OverlayGameplayActive, 1);
         return true;
     }
 
+    const DWORD lastEvidenceTick = static_cast<DWORD>(g_direct3D9OverlayLastGameplayEvidenceTick);
+    if (lastEvidenceTick != 0 && now - lastEvidenceTick <= kOverlayGameplayGraceMilliseconds) {
+        InterlockedExchange(&g_direct3D9OverlayGameplayActive, 1);
+        return true;
+    }
+
+    InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
     return false;
 }
 
@@ -4387,14 +4429,13 @@ int scaledOverlayMapWidth() {
     return scaledOverlayCoordinate(g_direct3D9OverlayTransform.mapWidth);
 }
 
-int direct3D9OverlayBaseX(IDirect3DDevice9* device, UINT& renderTargetWidth, UINT& renderTargetHeight) {
+int metadataOverlayBaseX(UINT renderTargetWidth) {
     int baseX = g_direct3D9OverlayTransform.offsetX;
     if (!g_direct3D9OverlayTransform.autoViewportX) {
         return baseX;
     }
 
-    if ((renderTargetWidth == 0 || renderTargetHeight == 0)
-        && !getDirect3D9RenderTargetSize(device, renderTargetWidth, renderTargetHeight)) {
+    if (renderTargetWidth == 0) {
         return baseX;
     }
 
@@ -4406,16 +4447,13 @@ int direct3D9OverlayBaseX(IDirect3DDevice9* device, UINT& renderTargetWidth, UIN
     return ((static_cast<int>(renderTargetWidth) - mapWidth) / 2) + baseX;
 }
 
-int direct3D9OverlayBaseY(IDirect3DDevice9* device, UINT& renderTargetWidth, UINT& renderTargetHeight) {
-    renderTargetWidth = 0;
-    renderTargetHeight = 0;
-
+int metadataOverlayBaseY(UINT renderTargetHeight) {
     int baseY = g_direct3D9OverlayTransform.offsetY;
     if (!g_direct3D9OverlayTransform.autoViewportY) {
         return baseY;
     }
 
-    if (!getDirect3D9RenderTargetSize(device, renderTargetWidth, renderTargetHeight)) {
+    if (renderTargetHeight == 0) {
         return baseY;
     }
 
@@ -4433,7 +4471,8 @@ int direct3D9OverlayBaseY(IDirect3DDevice9* device, UINT& renderTargetWidth, UIN
     return autoBaseY + baseY;
 }
 
-void logDirect3D9OverlayTransform(
+void logMetadataOverlayTransform(
+    const char* rendererName,
     UINT renderTargetWidth,
     UINT renderTargetHeight,
     int baseX,
@@ -4483,7 +4522,9 @@ void logDirect3D9OverlayTransform(
     }
 
     std::ostringstream message;
-    message << "runtime probe: Direct3D9 metadata overlay transform: renderTarget "
+    message << "runtime probe: "
+            << rendererName
+            << " metadata overlay transform: renderTarget "
             << renderTargetWidth
             << "x"
             << renderTargetHeight
@@ -5163,34 +5204,40 @@ void updateTouchedOverlayWallsFromActiveWorm() {
     }
 }
 
-void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
+bool prepareMetadataOverlayScreenRects(
+    const char* rendererName,
+    UINT renderTargetWidth,
+    UINT renderTargetHeight,
+    std::vector<ScreenOverlayRect>& screenRects) {
+    screenRects.clear();
+
     syncDirect3D9OverlayMapFromDetectedFile();
     refreshDetectedMapCacheForActiveOverlay();
 
     if (g_direct3D9OverlayTestRects.empty()) {
-        return;
+        return false;
     }
 
     if (!direct3D9OverlayGameplayReady()) {
-        return;
+        return false;
+    }
+
+    if (renderTargetWidth == 0 || renderTargetHeight == 0) {
+        return false;
     }
 
     updateTouchedOverlayWallsFromActiveWorm();
 
-    UINT renderTargetWidth = 0;
-    UINT renderTargetHeight = 0;
-    int baseY = direct3D9OverlayBaseY(device, renderTargetWidth, renderTargetHeight);
-    int baseX = direct3D9OverlayBaseX(device, renderTargetWidth, renderTargetHeight);
+    int baseX = metadataOverlayBaseX(renderTargetWidth);
+    int baseY = metadataOverlayBaseY(renderTargetHeight);
     const CameraTrackingSnapshot camera = g_direct3D9OverlayTransform.cameraFollow
         ? currentCameraTrackingSnapshot(g_direct3D9OverlayTransform.cameraSlot)
         : CameraTrackingSnapshot{};
-    if (g_direct3D9OverlayTransform.cameraFollow && camera.available) {
-        if ((renderTargetWidth == 0 || renderTargetHeight == 0)
-            && !getDirect3D9RenderTargetSize(device, renderTargetWidth, renderTargetHeight)) {
-            logDirect3D9OverlayTransform(renderTargetWidth, renderTargetHeight, baseX, baseY, camera);
-            return;
-        }
+    if (g_direct3D9OverlayTransform.cameraFollow && camera.available && !metadataOverlayCameraWithinMapBounds(camera)) {
+        return false;
+    }
 
+    if (g_direct3D9OverlayTransform.cameraFollow && camera.available) {
         baseX = (static_cast<int>(renderTargetWidth) / 2)
             - camera.xPixels
             + g_direct3D9OverlayTransform.offsetX;
@@ -5198,22 +5245,54 @@ void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
             - camera.yPixels
             + g_direct3D9OverlayTransform.offsetY;
     }
-    logDirect3D9OverlayTransform(renderTargetWidth, renderTargetHeight, baseX, baseY, camera);
+    logMetadataOverlayTransform(
+        rendererName != nullptr ? rendererName : "renderer",
+        renderTargetWidth,
+        renderTargetHeight,
+        baseX,
+        baseY,
+        camera);
 
-    std::size_t drawn = 0;
-    HRESULT firstFailure = S_OK;
-
+    screenRects.reserve(g_direct3D9OverlayTestRects.size());
     for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
-        const D3DCOLOR color = rect.touched ? rect.touchedColor : rect.color;
-        const Direct3D9OverlayRect transformedRect{
+        const DWORD color = rect.touched ? rect.touchedColor : rect.color;
+        screenRects.push_back(ScreenOverlayRect{
             static_cast<LONG>(scaledOverlayCoordinate(rect.left) + baseX),
             static_cast<LONG>(scaledOverlayCoordinate(rect.top) + baseY),
             static_cast<LONG>(scaledOverlayCoordinate(rect.right) + baseX),
             static_cast<LONG>(scaledOverlayCoordinate(rect.bottom) + baseY),
             color,
-            rect.touchedColor,
-            rect.wallIndex,
-            rect.touched,
+        });
+    }
+
+    return !screenRects.empty();
+}
+
+void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
+    UINT renderTargetWidth = 0;
+    UINT renderTargetHeight = 0;
+    if (!getDirect3D9RenderTargetSize(device, renderTargetWidth, renderTargetHeight)) {
+        return;
+    }
+
+    std::vector<ScreenOverlayRect> screenRects;
+    if (!prepareMetadataOverlayScreenRects("Direct3D9", renderTargetWidth, renderTargetHeight, screenRects)) {
+        return;
+    }
+
+    std::size_t drawn = 0;
+    HRESULT firstFailure = S_OK;
+
+    for (const ScreenOverlayRect& rect : screenRects) {
+        const Direct3D9OverlayRect transformedRect{
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            static_cast<D3DCOLOR>(rect.color),
+            0,
+            0,
+            false,
         };
         const HRESULT result = drawDirect3D9OverlayRect(device, transformedRect);
         if (SUCCEEDED(result)) {
@@ -5241,6 +5320,169 @@ void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
             std::ostringstream message;
             message << "runtime probe: Direct3D9 metadata overlay failed with HRESULT "
                     << formatHex32(static_cast<std::uint32_t>(firstFailure));
+            g_runtimeProbeLogger->warn(message.str());
+        }
+    }
+}
+
+enum class OpenGLOverlayPass {
+    BeforeSwap,
+    AfterSwap,
+    AfterGlEnd,
+};
+
+const char* openGLOverlayPassName(OpenGLOverlayPass pass) {
+    switch (pass) {
+    case OpenGLOverlayPass::AfterSwap:
+        return "after-swap-front";
+    case OpenGLOverlayPass::AfterGlEnd:
+        return "after-glEnd";
+    case OpenGLOverlayPass::BeforeSwap:
+    default:
+        return "before-swap";
+    }
+}
+
+bool getOpenGLViewportSize(UINT& width, UINT& height) {
+    width = 0;
+    height = 0;
+
+    if (wglGetCurrentContext() == nullptr) {
+        return false;
+    }
+
+    GLint viewport[4] = {};
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    if (viewport[2] <= 0 || viewport[3] <= 0) {
+        return false;
+    }
+
+    width = static_cast<UINT>(viewport[2]);
+    height = static_cast<UINT>(viewport[3]);
+    return true;
+}
+
+bool drawOpenGLOverlayRect(const ScreenOverlayRect& rect, UINT viewportWidth, UINT viewportHeight) {
+    if (rect.right <= rect.left || rect.bottom <= rect.top) {
+        return false;
+    }
+
+    const LONG left = std::clamp<LONG>(rect.left, 0, static_cast<LONG>(viewportWidth));
+    const LONG top = std::clamp<LONG>(rect.top, 0, static_cast<LONG>(viewportHeight));
+    const LONG right = std::clamp<LONG>(rect.right, 0, static_cast<LONG>(viewportWidth));
+    const LONG bottom = std::clamp<LONG>(rect.bottom, 0, static_cast<LONG>(viewportHeight));
+    if (right <= left || bottom <= top) {
+        return false;
+    }
+
+    const GLfloat alpha = static_cast<GLfloat>((rect.color >> 24) & 0xFF) / 255.0f;
+    const GLfloat red = static_cast<GLfloat>((rect.color >> 16) & 0xFF) / 255.0f;
+    const GLfloat green = static_cast<GLfloat>((rect.color >> 8) & 0xFF) / 255.0f;
+    const GLfloat blue = static_cast<GLfloat>(rect.color & 0xFF) / 255.0f;
+
+    glScissor(
+        left,
+        static_cast<GLint>(viewportHeight) - bottom,
+        right - left,
+        bottom - top);
+    glClearColor(red, green, blue, alpha);
+    glClear(GL_COLOR_BUFFER_BIT);
+    return true;
+}
+
+void drawOpenGLOverlayTestRects(OpenGLOverlayPass pass) {
+    UINT viewportWidth = 0;
+    UINT viewportHeight = 0;
+    if (!getOpenGLViewportSize(viewportWidth, viewportHeight)) {
+        return;
+    }
+
+    std::vector<ScreenOverlayRect> screenRects;
+    if (!prepareMetadataOverlayScreenRects("OpenGL", viewportWidth, viewportHeight, screenRects)) {
+        return;
+    }
+
+    GLint previousMatrixMode = GL_MODELVIEW;
+    GLint previousDrawBuffer = GL_BACK;
+    glGetIntegerv(GL_MATRIX_MODE, &previousMatrixMode);
+    glGetIntegerv(GL_DRAW_BUFFER, &previousDrawBuffer);
+
+    const LONG contextLogHits = InterlockedIncrement(&g_openGLMetadataOverlayContextLogHits);
+    if (contextLogHits <= 4 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime probe: OpenGL metadata overlay context: hglrc "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(wglGetCurrentContext()))
+                << ", hdc "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(wglGetCurrentDC()))
+                << ", viewport "
+                << viewportWidth
+                << "x"
+                << viewportHeight
+                << ", drawBuffer "
+                << formatHex32(static_cast<std::uint32_t>(previousDrawBuffer))
+                << ", pass "
+                << openGLOverlayPassName(pass);
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    glPushAttrib(GL_ALL_ATTRIB_BITS);
+
+    const GLenum drawBuffer = pass == OpenGLOverlayPass::AfterSwap
+        ? GL_FRONT
+        : static_cast<GLenum>(previousDrawBuffer);
+    glDrawBuffer(drawBuffer);
+    GLenum drawBufferError = glGetError();
+    if (drawBufferError != GL_NO_ERROR) {
+        glDrawBuffer(previousDrawBuffer);
+        drawBufferError = glGetError();
+    }
+
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_SCISSOR_TEST);
+
+    std::size_t drawn = 0;
+    for (const ScreenOverlayRect& rect : screenRects) {
+        if (drawOpenGLOverlayRect(rect, viewportWidth, viewportHeight)) {
+            ++drawn;
+        }
+    }
+
+    glMatrixMode(previousMatrixMode);
+
+    glFlush();
+
+    glPopAttrib();
+
+    const GLenum error = glGetError();
+    if (drawn > 0 && error == GL_NO_ERROR && drawBufferError == GL_NO_ERROR) {
+        const LONG hits = InterlockedIncrement(&g_openGLMetadataOverlayDrawHits);
+        if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: OpenGL metadata overlay drew "
+                    << drawn
+                    << " rect(s) on "
+                    << openGLOverlayPassName(pass);
+            g_runtimeProbeLogger->info(message.str());
+        }
+        return;
+    }
+
+    if (error != GL_NO_ERROR || drawBufferError != GL_NO_ERROR) {
+        const LONG failures = InterlockedIncrement(&g_openGLMetadataOverlayFailureHits);
+        if (failures == 1 && g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: OpenGL metadata overlay failed with GL error "
+                    << formatHex32(static_cast<std::uint32_t>(error))
+                    << ", drawBuffer error "
+                    << formatHex32(static_cast<std::uint32_t>(drawBufferError));
             g_runtimeProbeLogger->warn(message.str());
         }
     }
@@ -5936,6 +6178,10 @@ BOOL WINAPI hookedSwapBuffers(HDC deviceContext) {
         return FALSE;
     }
 
+    if (g_openGLEndProbeHits == 0) {
+        drawOpenGLOverlayTestRects(OpenGLOverlayPass::BeforeSwap);
+    }
+
     return g_originalSwapBuffers(deviceContext);
 }
 
@@ -6069,6 +6315,30 @@ FARPROC direct3DCreate9DetourAsFarproc() {
     return result;
 }
 
+void APIENTRY hookedOpenGLEnd() {
+    OpenGLEndFunction originalEnd = g_originalOpenGLEnd;
+    if (originalEnd == nullptr) {
+        return;
+    }
+
+    originalEnd();
+
+    const LONG hits = InterlockedIncrement(&g_openGLEndProbeHits);
+    if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+        g_runtimeProbeLogger->info("runtime probe: OpenGL glEnd hook fired");
+    }
+
+    drawOpenGLOverlayTestRects(OpenGLOverlayPass::AfterGlEnd);
+}
+
+FARPROC openGLEndDetourAsFarproc() {
+    OpenGLEndFunction detour = &hookedOpenGLEnd;
+    FARPROC result = nullptr;
+    static_assert(sizeof(result) == sizeof(detour));
+    std::memcpy(&result, &detour, sizeof(result));
+    return result;
+}
+
 FARPROC WINAPI hookedGetProcAddress(HMODULE module, LPCSTR procName) {
     if (g_originalGetProcAddress == nullptr) {
         SetLastError(ERROR_PROC_NOT_FOUND);
@@ -6099,6 +6369,17 @@ FARPROC WINAPI hookedGetProcAddress(HMODULE module, LPCSTR procName) {
             g_runtimeProbeLogger->info(message.str());
         }
         return direct3DCreate9DetourAsFarproc();
+    }
+
+    if (proc != nullptr && isNamedProc(procName, "glEnd")) {
+        g_originalOpenGLEnd = reinterpret_cast<OpenGLEndFunction>(proc);
+        if (g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime probe: replacing GetProcAddress glEnd result with detour "
+                    << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedOpenGLEnd));
+            g_runtimeProbeLogger->info(message.str());
+        }
+        return openGLEndDetourAsFarproc();
     }
 
     return proc;
@@ -6430,7 +6711,13 @@ bool WaHookManager::initialize(
         return false;
     }
 
-    if (!enableMessagePumpProbe && !enableRenderProbe && !enableRendererApiProbe && !enableCameraProbe && !enableDirect3D9Probe) {
+    const bool enableMetadataOverlayHooks = !direct3D9OverlayMaps.empty() || !direct3D9OverlayTestRects.empty();
+    if (!enableMessagePumpProbe
+        && !enableRenderProbe
+        && !enableRendererApiProbe
+        && !enableCameraProbe
+        && !enableDirect3D9Probe
+        && !enableMetadataOverlayHooks) {
         logger.info("hook runtime mode enabled, but no runtime probe hook is enabled in configuration");
         initialized_ = true;
         return true;
@@ -6474,6 +6761,11 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_cameraTrackingBaselineValid, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayDrawHits, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayFailureHits, 0);
+    InterlockedExchange(&g_openGLMetadataOverlayDrawHits, 0);
+    InterlockedExchange(&g_openGLMetadataOverlayFailureHits, 0);
+    InterlockedExchange(&g_openGLMetadataOverlayContextLogHits, 0);
+    InterlockedExchange(&g_openGLEndProbeHits, 0);
+    g_originalOpenGLEnd = nullptr;
     InterlockedExchange(&g_direct3D9MetadataOverlayTransformLogHits, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayLastBackBufferWidth, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayLastBackBufferHeight, 0);
@@ -6505,6 +6797,7 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_cachedDefaultMapSeedLogCount, 0);
     InterlockedExchange(&g_direct3D9OverlayActivationLogCount, 0);
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
+    InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
     InterlockedExchange(&g_direct3D9OverlayGameplayLogCount, 0);
     {
         std::lock_guard<std::mutex> lock(g_detectedMapMutex);
@@ -6638,7 +6931,7 @@ bool WaHookManager::initialize(
         }
     }
 
-    if (enableRenderProbe) {
+    if (enableRenderProbe || enableMetadataOverlayHooks) {
         InterlockedExchange(&g_swapBuffersProbeHits, 0);
         InterlockedExchange(&g_bitBltProbeHits, 0);
         InterlockedExchange(&g_stretchBltProbeHits, 0);
