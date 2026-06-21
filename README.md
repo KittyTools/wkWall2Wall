@@ -2,7 +2,7 @@
 
 wkWall2Wall is an experimental WormKit module for Worms Armageddon Wall-X-Wall games.
 
-The goal is simple: when a worm touches a configured wall during a Wall-X-Wall turn, that wall is highlighted as touched. At the beginning of the next turn, the touched walls are reset.
+The goal is simple: when a worm touches a configured wall during a Wall-X-Wall turn, that wall is highlighted as touched. Untouched walls keep the original map look. At the beginning of the next turn, the touched walls are reset.
 
 This project is open source so the W:A community can test it, fork it, improve it, and adapt it to more renderers, schemes, maps, and hosting setups.
 
@@ -13,8 +13,8 @@ wkWall2Wall is in active development and should be treated as alpha software.
 Current alpha build supports:
 
 - loading wall metadata from `.w2w.ini` files
-- drawing wall overlays in-game
-- renderer overlays for Direct3D 9, OpenGL, DirectDraw, and Direct3D 7
+- drawing touched-wall highlights in-game without marking untouched walls
+- renderer overlays for Direct3D 9, DirectDraw, and Direct3D 7, with OpenGL kept as a best-effort fallback
 - detecting wall touches from W:A physics/collision hooks
 - rope collisions, walking contacts, jump contacts, and low-speed rope drop contacts
 - resetting touched walls from W:A turn-end messages
@@ -25,6 +25,7 @@ Current alpha build supports:
 Known limitations:
 
 - wall touch detection is much more reliable than early tracking builds, but rare missed touches may still happen
+- OpenGL does not currently provide the same smooth highlight path as Direct3D 9 and may be less polished
 - online synchronization is not ready for normal public games
 - if one player does not have the module in an online match, the current alpha build does not yet provide the final compatibility handshake
 - `.BIT` map support in the wall editor is not implemented yet
@@ -135,6 +136,7 @@ Useful ways to help:
 - test manual and automatic worm placement schemes
 - improve active worm tracking and turn reset detection
 - improve the wall editor
+- add custom touch/validation sounds in a way that stays online-compatible
 - add documentation for players
 - review hook safety and renderer compatibility
 

@@ -509,6 +509,27 @@ struct ScreenOverlayRect {
     DWORD color = 0;
 };
 
+void appendTouchedWallVisualRects(
+    std::vector<ScreenOverlayRect>& screenRects,
+    LONG left,
+    LONG top,
+    LONG right,
+    LONG bottom,
+    std::size_t wallIndex) {
+    (void)wallIndex;
+    if (right <= left || bottom <= top) {
+        return;
+    }
+
+    screenRects.push_back(ScreenOverlayRect{
+        left,
+        top,
+        right,
+        bottom,
+        0x8000FF40,
+    });
+}
+
 struct CameraTrackingSnapshot {
     bool available = false;
     int slot = 0;
@@ -1248,6 +1269,12 @@ bool waTaskMessageLooksTurnRelated(std::uint32_t messageType) {
         return false;
     }
 }
+
+enum class OpenGLOverlayPass {
+    BeforeSwap,
+    AfterGlEnd,
+};
+void drawOpenGLOverlayTestRects(OpenGLOverlayPass pass);
 
 LONG readTurnGameLong(void* turnGame, std::uintptr_t offset) {
     if (turnGame == nullptr) {
@@ -5748,6 +5775,74 @@ HRESULT drawDirect3D9OverlayRect(IDirect3DDevice9* device, const Direct3D9Overla
     return device->Clear(1, &d3dRect, D3DCLEAR_TARGET, rect.color, 1.0f, 0);
 }
 
+HRESULT drawDirect3D9AlphaOverlayRects(IDirect3DDevice9* device, const std::vector<ScreenOverlayRect>& rects) {
+    if (device == nullptr || rects.empty()) {
+        return D3DERR_INVALIDCALL;
+    }
+
+    struct Vertex {
+        float x;
+        float y;
+        float z;
+        float rhw;
+        D3DCOLOR color;
+    };
+
+    std::vector<Vertex> vertices;
+    vertices.reserve(rects.size() * 6);
+    for (const ScreenOverlayRect& rect : rects) {
+        if (rect.right <= rect.left || rect.bottom <= rect.top) {
+            continue;
+        }
+
+        const auto left = static_cast<float>(rect.left);
+        const auto top = static_cast<float>(rect.top);
+        const auto right = static_cast<float>(rect.right);
+        const auto bottom = static_cast<float>(rect.bottom);
+        const auto color = static_cast<D3DCOLOR>(rect.color);
+
+        vertices.push_back(Vertex{left, top, 0.0f, 1.0f, color});
+        vertices.push_back(Vertex{right, top, 0.0f, 1.0f, color});
+        vertices.push_back(Vertex{left, bottom, 0.0f, 1.0f, color});
+        vertices.push_back(Vertex{right, top, 0.0f, 1.0f, color});
+        vertices.push_back(Vertex{right, bottom, 0.0f, 1.0f, color});
+        vertices.push_back(Vertex{left, bottom, 0.0f, 1.0f, color});
+    }
+
+    if (vertices.empty()) {
+        return D3DERR_INVALIDCALL;
+    }
+
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) && stateBlock != nullptr) {
+        stateBlock->Capture();
+    }
+
+    device->SetTexture(0, nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetVertexShader(nullptr);
+    device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+
+    const HRESULT result = device->DrawPrimitiveUP(
+        D3DPT_TRIANGLELIST,
+        static_cast<UINT>(vertices.size() / 3),
+        vertices.data(),
+        sizeof(Vertex));
+
+    if (stateBlock != nullptr) {
+        stateBlock->Apply();
+        stateBlock->Release();
+    }
+
+    return result;
+}
+
 bool getDirect3D9RenderTargetSize(IDirect3DDevice9* device, UINT& width, UINT& height) {
     width = 0;
     height = 0;
@@ -6719,14 +6814,17 @@ bool prepareMetadataOverlayScreenRects(
 
     screenRects.reserve(g_direct3D9OverlayTestRects.size());
     for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
-        const DWORD color = rect.touched ? rect.touchedColor : rect.color;
-        screenRects.push_back(ScreenOverlayRect{
+        if (!rect.touched) {
+            continue;
+        }
+
+        appendTouchedWallVisualRects(
+            screenRects,
             static_cast<LONG>(scaledOverlayCoordinate(rect.left) + baseX),
             static_cast<LONG>(scaledOverlayCoordinate(rect.top) + baseY),
             static_cast<LONG>(scaledOverlayCoordinate(rect.right) + baseX),
             static_cast<LONG>(scaledOverlayCoordinate(rect.bottom) + baseY),
-            color,
-        });
+            rect.wallIndex);
     }
 
     return !screenRects.empty();
@@ -6744,27 +6842,8 @@ void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
         return;
     }
 
-    std::size_t drawn = 0;
-    HRESULT firstFailure = S_OK;
-
-    for (const ScreenOverlayRect& rect : screenRects) {
-        const Direct3D9OverlayRect transformedRect{
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            static_cast<D3DCOLOR>(rect.color),
-            0,
-            0,
-            false,
-        };
-        const HRESULT result = drawDirect3D9OverlayRect(device, transformedRect);
-        if (SUCCEEDED(result)) {
-            ++drawn;
-        } else if (SUCCEEDED(firstFailure)) {
-            firstFailure = result;
-        }
-    }
+    const HRESULT result = drawDirect3D9AlphaOverlayRects(device, screenRects);
+    const std::size_t drawn = SUCCEEDED(result) ? screenRects.size() : 0;
 
     if (drawn > 0) {
         const LONG hits = InterlockedIncrement(&g_direct3D9MetadataOverlayDrawHits);
@@ -6778,27 +6857,19 @@ void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
         return;
     }
 
-    if (FAILED(firstFailure)) {
+    if (FAILED(result)) {
         const LONG failures = InterlockedIncrement(&g_direct3D9MetadataOverlayFailureHits);
         if (failures == 1 && g_runtimeProbeLogger != nullptr) {
             std::ostringstream message;
             message << "runtime probe: Direct3D9 metadata overlay failed with HRESULT "
-                    << formatHex32(static_cast<std::uint32_t>(firstFailure));
+                    << formatHex32(static_cast<std::uint32_t>(result));
             g_runtimeProbeLogger->warn(message.str());
         }
     }
 }
 
-enum class OpenGLOverlayPass {
-    BeforeSwap,
-    AfterSwap,
-    AfterGlEnd,
-};
-
 const char* openGLOverlayPassName(OpenGLOverlayPass pass) {
     switch (pass) {
-    case OpenGLOverlayPass::AfterSwap:
-        return "after-swap-front";
     case OpenGLOverlayPass::AfterGlEnd:
         return "after-glEnd";
     case OpenGLOverlayPass::BeforeSwap:
@@ -6891,10 +6962,7 @@ void drawOpenGLOverlayTestRects(OpenGLOverlayPass pass) {
 
     glPushAttrib(GL_ALL_ATTRIB_BITS);
 
-    const GLenum drawBuffer = pass == OpenGLOverlayPass::AfterSwap
-        ? GL_FRONT
-        : static_cast<GLenum>(previousDrawBuffer);
-    glDrawBuffer(drawBuffer);
+    glDrawBuffer(static_cast<GLenum>(previousDrawBuffer));
     GLenum drawBufferError = glGetError();
     if (drawBufferError != GL_NO_ERROR) {
         glDrawBuffer(previousDrawBuffer);
