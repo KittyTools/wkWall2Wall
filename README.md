@@ -10,20 +10,23 @@ This project is open source so the W:A community can test it, fork it, improve i
 
 wkWall2Wall is in active development and should be treated as alpha software.
 
-Current development focus:
+Current alpha build supports:
 
 - loading wall metadata from `.w2w.ini` files
 - drawing wall overlays in-game
-- tracking the active worm well enough to detect wall touches
-- resetting touched walls between turns
+- renderer overlays for Direct3D 9, OpenGL, DirectDraw, and Direct3D 7
+- detecting wall touches from W:A physics/collision hooks
+- rope collisions, walking contacts, jump contacts, and low-speed rope drop contacts
+- resetting touched walls from W:A turn-end messages
+- automatic loading of cached map metadata when W:A reuses the last played map
 - keeping offline play usable for local testing
-- preparing safe online behavior where the module stays disabled unless all players have a compatible version
+- keeping maps without matching wall metadata passive
 
 Known limitations:
 
-- current in-game behavior is still being tested and may regress between builds
-- renderer support is not final
+- wall touch detection is much more reliable than early tracking builds, but rare missed touches may still happen
 - online synchronization is not ready for normal public games
+- if one player does not have the module in an online match, the current alpha build does not yet provide the final compatibility handshake
 - `.BIT` map support in the wall editor is not implemented yet
 
 Validated builds should be tracked in `TEST_LOG.md`.
@@ -71,7 +74,7 @@ tools/wall-editor/index.html
 Basic workflow:
 
 1. Open the editor in a browser.
-2. Choose a map image.
+2. Choose a map image from `Worms Armageddon\User\SavedLevels`.
 3. Draw rectangles around the Wall-X-Wall target walls.
 4. Adjust the rectangles until they match the walls.
 5. Export the `.w2w.ini` file.
@@ -90,7 +93,7 @@ The intended online model is host-driven:
 
 If one player does not have a compatible wkWall2Wall version, the module should stay passive and the game should behave normally.
 
-This online sync flow is not ready for normal public matches yet.
+This online sync flow is the next major piece of work and is not ready for normal public matches yet.
 
 ## Building
 

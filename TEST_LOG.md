@@ -1,16 +1,30 @@
 # wkWall2Wall Test Log
 
-Rule: every DLL build that is copied to the Worms Armageddon directory and tested in-game must get its own commit.
+## 2026-06-22 - Renderer and Collision Candidate
 
-For each tested build, record:
+DLL SHA256:
 
-- commit hash
-- DLL SHA256
-- W:A renderer and resolution
-- scheme notes, especially manual or automatic worm placement
-- result: OK, regression, crash, or partial
-- short notes about what was tested
+```text
+3049E95853D721CA5D8A34263AC8DDAFA719D35A3531EA36E9492754481F9C23
+```
 
-## Entries
+Validated areas:
 
-No committed in-game test entry yet.
+- Direct3D 9 overlay and wall touch behavior
+- OpenGL overlay and wall touch behavior
+- DirectDraw overlay and wall touch behavior
+- Direct3D 7 overlay and wall touch behavior
+- manual worm placement
+- automatic worm placement
+- centered camera
+- free camera
+- map cache loading when W:A reuses the last played map
+- maps without matching wall metadata staying passive
+- wall reset on W:A turn-end messages
+- rope, walking, jump, and low-speed rope drop contacts
+
+Notes:
+
+- Overall behavior is stable enough for the next gameplay pass.
+- Rare missed wall touches may still happen and should be investigated with targeted logs if they become reproducible.
+- Online host/client synchronization is not implemented yet.

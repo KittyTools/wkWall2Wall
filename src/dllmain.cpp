@@ -5,12 +5,15 @@
 #include "WallMetadata.h"
 
 #include <Windows.h>
+#include <wincrypt.h>
 
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <iomanip>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -81,14 +84,101 @@ bool sameAsciiText(const std::string& left, const std::string& right) {
     return !left.empty() && !right.empty() && lowerAscii(left) == lowerAscii(right);
 }
 
+bool fileExists(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::string sha256FileHex(const std::string& path) {
+    if (!fileExists(path)) {
+        return {};
+    }
+
+    HANDLE file = CreateFileA(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+    std::string result;
+    if (CryptAcquireContextA(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)
+        && CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) {
+        std::array<BYTE, 32768> buffer = {};
+        DWORD bytesRead = 0;
+        bool ok = true;
+        while (true) {
+            if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)) {
+                ok = false;
+                break;
+            }
+            if (bytesRead == 0) {
+                break;
+            }
+            if (!CryptHashData(hash, buffer.data(), bytesRead, 0)) {
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok) {
+            std::array<BYTE, 32> digest = {};
+            DWORD digestSize = static_cast<DWORD>(digest.size());
+            if (CryptGetHashParam(hash, HP_HASHVAL, digest.data(), &digestSize, 0)) {
+                std::ostringstream stream;
+                stream << std::hex << std::setfill('0');
+                for (DWORD index = 0; index < digestSize; ++index) {
+                    stream << std::setw(2) << static_cast<unsigned int>(digest[index]);
+                }
+                result = stream.str();
+            }
+        }
+    }
+
+    if (hash != 0) {
+        CryptDestroyHash(hash);
+    }
+    if (provider != 0) {
+        CryptReleaseContext(provider, 0);
+    }
+    CloseHandle(file);
+    return result;
+}
+
 bool overlayCatalogHasFileName(const std::vector<WaOverlayMap>& maps, const std::string& fileName) {
     const std::string candidateFileName = fileNameOnlyFromPath(fileName);
+    const std::string candidateHash = sha256FileHex(fileName);
+    bool hasHashConstrainedCandidate = false;
     for (const WaOverlayMap& map : maps) {
-        if (sameAsciiText(fileNameOnlyFromPath(map.fileName), candidateFileName)) {
+        if (!sameAsciiText(fileNameOnlyFromPath(map.fileName), candidateFileName)) {
+            continue;
+        }
+
+        if (!map.sha256.empty()) {
+            hasHashConstrainedCandidate = true;
+            if (!candidateHash.empty() && sameAsciiText(map.sha256, candidateHash)) {
+                return true;
+            }
+            continue;
+        }
+
+        if (candidateHash.empty()) {
             return true;
         }
     }
 
+    (void)hasHashConstrainedCandidate;
     return false;
 }
 
@@ -136,6 +226,12 @@ std::string readCachedMapPath(
         return {};
     }
 
+    const int cacheFormatVersion = GetPrivateProfileIntA("Map", "CacheFormatVersion", 0, cachePath.c_str());
+    if (cacheFormatVersion < 2) {
+        logger.info("cached default wall map ignored because cache format is obsolete");
+        return {};
+    }
+
     const std::string cachedPath = readStringValue(cachePath, "Map", "LastPath");
     const std::string cachedFile = readStringValue(cachePath, "Map", "LastFile");
     const std::string candidate = !cachedPath.empty() ? cachedPath : cachedFile;
@@ -143,15 +239,32 @@ std::string readCachedMapPath(
         return {};
     }
 
-    const std::uint64_t cachedTime = parseUnsigned64(
-        readStringValue(cachePath, "Map", "CustomDatWriteTimeUtc"));
-    const std::uint64_t currentTime = fileWriteTimeUtc(customDatPath);
-    if (cachedTime != 0 && currentTime != 0 && cachedTime != currentTime) {
-        logger.info("cached default wall map ignored because custom.dat has changed since it was recorded");
+    const std::string cachedSourceMapSha256 = readStringValue(cachePath, "Map", "SourceMapSha256");
+    const std::string currentSourceMapSha256 = sha256FileHex(candidate);
+    if (cachedSourceMapSha256.empty()
+        || currentSourceMapSha256.empty()
+        || !sameAsciiText(cachedSourceMapSha256, currentSourceMapSha256)) {
+        logger.info("cached default wall map ignored because source map SHA-256 does not match");
         return {};
     }
 
-    cachedCustomDatWriteTime = cachedTime;
+    const std::string cachedCustomDatSha256 = readStringValue(cachePath, "Map", "CustomDatSha256");
+    if (cachedCustomDatSha256.empty()) {
+        logger.info("cached default wall map ignored because custom.dat SHA-256 was not recorded");
+        return {};
+    }
+
+    const std::string currentCustomDatSha256 = sha256FileHex(customDatPath);
+    if (currentCustomDatSha256.empty() || !sameAsciiText(cachedCustomDatSha256, currentCustomDatSha256)) {
+        logger.info("cached default wall map ignored because current custom.dat SHA-256 does not match the recorded map");
+        return {};
+    }
+
+    const std::uint64_t cachedTime = parseUnsigned64(
+        readStringValue(cachePath, "Map", "CustomDatWriteTimeUtc"));
+    const std::uint64_t currentTime = fileWriteTimeUtc(customDatPath);
+
+    cachedCustomDatWriteTime = currentTime != 0 ? currentTime : cachedTime;
     return candidate;
 }
 
@@ -300,6 +413,10 @@ DWORD WINAPI initializeModule(LPVOID) {
                     direct3D9OverlayMaps,
                     logger,
                     direct3D9OverlayTransform.cachedMapCustomDatWriteTime);
+                direct3D9OverlayTransform.cachedMapCustomDatSha256 = readStringValue(
+                    direct3D9OverlayTransform.mapCachePath,
+                    "Map",
+                    "CustomDatSha256");
 
                 std::ostringstream overlayMessage;
                 overlayMessage << "Direct3D9 metadata overlay test prepared "

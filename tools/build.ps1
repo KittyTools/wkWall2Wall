@@ -48,6 +48,7 @@ $arguments = @(
     "-lddraw",
     "-lgdi32",
     "-lopengl32",
+    "-ladvapi32",
     "-lversion",
     "-static",
     "-Wl,--exclude-all-symbols"

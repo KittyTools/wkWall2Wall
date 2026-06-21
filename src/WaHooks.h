@@ -34,6 +34,7 @@ struct WaOverlayTransform {
     std::string customDatPath;
     std::string cachedMapPath;
     std::uint64_t cachedMapCustomDatWriteTime = 0;
+    std::string cachedMapCustomDatSha256;
 };
 
 struct WaOverlayMap {
@@ -122,7 +123,13 @@ private:
     X86DetourHook cameraTrackingHook_;
     X86DetourHook cameraRenderCopyHook_;
     X86DetourHook cameraTargetAggregateHook_;
-    X86DetourHook gameTimerTransitionHook_;
+    X86DetourHook turnGameHandleMessageHook_;
     X86DetourHook wormMotionCandidateHook_;
+    X86DetourHook movementCollisionResultHook_;
+    X86DetourHook movementCollisionBranchHook_;
+    X86DetourHook movementCollisionPathHook_;
+    X86DetourHook collisionQueryCommonHook_;
+    X86DetourHook jumpTerrainCollisionResultHook_;
+    X86DetourHook movementResolutionSecondaryResultHook_;
     bool initialized_ = false;
 };

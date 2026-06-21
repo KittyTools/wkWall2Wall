@@ -7,15 +7,18 @@
 #include <d3d9.h>
 #include <ddraw.h>
 #include <gl/GL.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <sstream>
+#include <iomanip>
 #include <string>
 #include <vector>
 
@@ -28,13 +31,25 @@ constexpr std::size_t kSupportedWa381ImageSize = 0x00584000;
 constexpr std::uintptr_t kWa381CameraTrackingFunctionRva = 0x00142F70;
 constexpr std::uintptr_t kWa381CameraRenderCopyRva = 0x00134676;
 constexpr std::uintptr_t kWa381CameraTargetAggregateRva = 0x00147E70;
-constexpr std::uintptr_t kWa381GameTimerTransitionRva = 0x000ED4F0;
+constexpr std::uintptr_t kWa381TurnGameHandleMessageRva = 0x0015DC00;
 constexpr std::uintptr_t kWa381WormMotionCandidateRva = 0x0010D450;
+constexpr std::uintptr_t kWa381MovementCollisionResultRva = 0x000FE092;
+constexpr std::uintptr_t kWa381MovementCollisionBranchRva = 0x000FDBCB;
+constexpr std::uintptr_t kWa381MovementCollisionPathRva = 0x000FF520;
+constexpr std::uintptr_t kWa381CollisionQueryCommonRva = 0x000FB9D0;
+constexpr std::uintptr_t kWa381JumpTerrainCollisionResultRva = 0x0010DD4A;
+constexpr std::uintptr_t kWa381MovementResolutionSecondaryResultRva = 0x000FD0A4;
 constexpr std::size_t kWaCameraTrackingPatchLength = 5;
 constexpr std::size_t kWaCameraRenderCopyPatchLength = 6;
 constexpr std::size_t kWaCameraTargetAggregatePatchLength = 5;
-constexpr std::size_t kWaGameTimerTransitionPatchLength = 5;
+constexpr std::size_t kWaTurnGameHandleMessagePatchLength = 6;
 constexpr std::size_t kWaWormMotionCandidatePatchLength = 7;
+constexpr std::size_t kWaMovementCollisionResultPatchLength = 6;
+constexpr std::size_t kWaMovementCollisionBranchPatchLength = 6;
+constexpr std::size_t kWaMovementCollisionPathPatchLength = 5;
+constexpr std::size_t kWaCollisionQueryCommonPatchLength = 8;
+constexpr std::size_t kWaJumpTerrainCollisionResultPatchLength = 8;
+constexpr std::size_t kWaMovementResolutionResultPatchLength = 8;
 constexpr std::uintptr_t kWaCameraPointStructOffset = 0x8CBC;
 constexpr LONG kFixedPointOne = 0x10000;
 constexpr std::size_t kCameraTargetCallSampleSlots = 12;
@@ -56,24 +71,16 @@ constexpr std::uintptr_t kWaWormDataScanBytes = 0x180;
 constexpr std::uintptr_t kWaTeamNameStride = 0xBB8;
 constexpr std::uintptr_t kWaCurrentTeamByteOffset = 0xD9DC;
 constexpr std::intptr_t kWaTeamByteListOffset = -0x768;
-constexpr int kMaxWallTouchSweepPixels = 1200;
-constexpr int kWallTouchBounceRadiusPixels = 72;
-constexpr int kMinWallTouchBounceVelocityPixels = 2;
-constexpr int kActiveWormTouchRadiusPixels = 16;
-constexpr int kTrackingFallbackTouchRadiusPixels = 28;
 constexpr int kActiveWormReferenceKeepDistancePixels = 512;
 constexpr DWORD kActiveWormRefreshIntervalMilliseconds = 50;
 constexpr DWORD kActiveOwnerRecentMotionKeepMilliseconds = 750;
 constexpr DWORD kRecentMotionHandoffMilliseconds = 1500;
-constexpr DWORD kTrackingFallbackTurnResetMinAgeMilliseconds = 1500;
-constexpr DWORD kAggregateOwnerTurnResetMinAgeMilliseconds = 5000;
-constexpr DWORD kGameTimerTransitionResetDebounceMilliseconds = 1000;
+constexpr DWORD kTurnGameFinishTurnResetDebounceMilliseconds = 1000;
 constexpr DWORD kOverlayWormEvidenceKeepMilliseconds = 1000;
 constexpr DWORD kOverlayGameplayGraceMilliseconds = 250;
+constexpr DWORD kDetectedMapCacheRefreshWindowMilliseconds = 15000;
 constexpr DWORD kDirectDrawSurfaceTransitionDebounceMilliseconds = 750;
 constexpr DWORD kDirectDrawSurfaceTransitionDrawCooldownMilliseconds = 1000;
-constexpr LONG kUnknownWallTouchTurnTeamByte = -1;
-constexpr LONG kFallbackWallTouchTurnOwnerAddress = -2;
 
 bool waObjectKindLooksLikeWorm(LONG objectKind) {
     return objectKind == kWaObjectKindWorm || objectKind == 101;
@@ -158,7 +165,7 @@ std::string formatRva(std::uintptr_t address, std::uintptr_t base) {
     return formatAddress(address - base);
 }
 
-const std::array<WaProbeSignature, 5> kWa381ProbeSignatures = {{
+const std::array<WaProbeSignature, 6> kWa381ProbeSignatures = {{
     {
         "main message pump",
         "safe first hook candidate; confirms W:A runtime message dispatch",
@@ -190,6 +197,15 @@ const std::array<WaProbeSignature, 5> kWa381ProbeSignatures = {{
         "85 C0 74 57",
         0x0019FAE0,
         4
+    },
+    {
+        "CTaskTurnGame::HandleMessage",
+        "turn-game task message dispatcher; candidate for true game turn boundaries",
+        "55 8B EC 83 E4 F8 81 EC ?? ?? ?? ?? 53 8B 5D 0C 56 8D 43 FE "
+        "83 F8 7B 57 8B F1 0F 87 ?? ?? ?? ?? 0F B6 80 ?? ?? ?? ?? "
+        "FF 24 85 ?? ?? ?? ?? 8B 86 ?? ?? ?? ??",
+        kWa381TurnGameHandleMessageRva,
+        2
     },
     {
         "WinMM timer transition",
@@ -244,6 +260,8 @@ using Direct3DCreate9Function = IDirect3D9*(WINAPI*)(UINT);
 using DirectDrawCreateFunction = HRESULT(WINAPI*)(GUID*, LPDIRECTDRAW*, IUnknown*);
 using DirectDrawCreateExFunction = HRESULT(WINAPI*)(GUID*, LPVOID*, REFIID, IUnknown*);
 using OpenGLEndFunction = void(APIENTRY*)();
+using WaTurnGameHandleMessageFunction =
+    int(__fastcall*)(void*, void*, void*, std::uint32_t, std::size_t, void*);
 
 GetMessageAFunction g_originalGetMessageA = nullptr;
 SwapBuffersFunction g_originalSwapBuffers = nullptr;
@@ -257,6 +275,7 @@ Direct3DCreate9Function g_originalDirect3DCreate9 = nullptr;
 DirectDrawCreateFunction g_originalDirectDrawCreate = nullptr;
 DirectDrawCreateExFunction g_originalDirectDrawCreateEx = nullptr;
 OpenGLEndFunction g_originalOpenGLEnd = nullptr;
+WaTurnGameHandleMessageFunction g_originalWaTurnGameHandleMessage = nullptr;
 Logger* g_runtimeProbeLogger = nullptr;
 volatile LONG g_getMessageProbeHits = 0;
 volatile LONG g_swapBuffersProbeHits = 0;
@@ -347,8 +366,6 @@ volatile LONG g_activeWormCandidateScanTick = 0;
 volatile LONG g_activeWormCandidateScanMissLogCount = 0;
 volatile LONG g_activeWormMovementLogCount = 0;
 volatile LONG g_wallTouchTurnOwnerAddress = 0;
-volatile LONG g_wallTouchTurnTeamByte = kUnknownWallTouchTurnTeamByte;
-volatile LONG g_wallTouchTurnFallbackTouchTick = 0;
 volatile LONG g_wallTouchResetLogCount = 0;
 volatile LONG g_wallTouchLastTouchTick = 0;
 volatile LONG g_wallTouchLastResetTick = 0;
@@ -357,18 +374,32 @@ volatile LONG g_waStateUiLogCount = 0;
 volatile LONG g_wormMotionCandidateProbeHits = 0;
 volatile LONG g_wormMotionCandidateProbeLogCount = 0;
 volatile LONG g_wormMotionCandidateLastOwnerAddress = 0;
-volatile LONG g_gameTimerTransitionProbeHits = 0;
-volatile LONG g_gameTimerTransitionLogCount = 0;
-volatile LONG g_gameTimerTransitionStateAddress = 0;
-volatile LONG g_gameTimerTransitionLastState = -1;
+volatile LONG g_movementCollisionResultProbeHits = 0;
+volatile LONG g_movementCollisionBranchProbeHits = 0;
+volatile LONG g_movementCollisionPathProbeHits = 0;
+volatile LONG g_collisionQueryCommonProbeHits = 0;
+volatile LONG g_jumpTerrainCollisionResultProbeHits = 0;
+volatile LONG g_jumpTerrainCollisionResultLogCount = 0;
+volatile LONG g_jumpTerrainCollisionResultNearWallLogCount = 0;
+volatile LONG g_movementResolutionResultProbeHits = 0;
+volatile LONG g_movementResolutionResultLogCount = 0;
+volatile LONG g_movementResolutionResultNearWallLogCount = 0;
+volatile LONG g_turnGameHandleMessageProbeHits = 0;
+volatile LONG g_turnGameHandleMessageLogCount = 0;
+volatile LONG g_turnGameFinishTurnLastResetTick = 0;
 volatile LONG g_direct3D9OverlayLastGameplayEvidenceTick = 0;
 bool g_direct3D9ProbeEnabled = false;
 bool g_direct3D9DeviceSlotProbeEnabled = false;
 bool g_direct3D9OverlaySmokeTestEnabled = false;
 void* g_cameraTrackingProbeStub = nullptr;
 void* g_cameraTargetAggregateProbeStub = nullptr;
-void* g_gameTimerTransitionProbeStub = nullptr;
 void* g_wormMotionCandidateProbeStub = nullptr;
+void* g_movementCollisionResultProbeStub = nullptr;
+void* g_movementCollisionBranchProbeStub = nullptr;
+void* g_movementCollisionPathProbeStub = nullptr;
+void* g_collisionQueryCommonProbeStub = nullptr;
+void* g_jumpTerrainCollisionResultProbeStub = nullptr;
+void* g_movementResolutionSecondaryResultProbeStub = nullptr;
 std::uintptr_t g_waModuleBase = 0;
 
 constexpr GUID kIUnknownGuid = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
@@ -452,6 +483,7 @@ struct DirectDrawObjectVtableHook {
 
 struct DirectDrawSurfaceVtableHook {
     std::uintptr_t* vtable = nullptr;
+    bool usesSurfaceDesc2 = false;
     DirectDrawSurfaceBltFunction originalBlt = nullptr;
     DirectDrawSurfaceBltFastFunction originalBltFast = nullptr;
     DirectDrawSurfaceFlipFunction originalFlip = nullptr;
@@ -564,10 +596,14 @@ std::string g_detectedMapCachePath;
 std::string g_customDatPath;
 std::string g_cachedDefaultMapPath;
 std::uint64_t g_cachedDefaultMapCustomDatWriteTime = 0;
+std::string g_cachedDefaultMapCustomDatSha256;
 std::uint64_t g_detectedMapCachedCustomDatWriteTime = 0;
+std::string g_detectedMapCachedCustomDatSha256;
 volatile LONG g_detectedMapSequence = 0;
 volatile LONG g_consumedMapSequence = 0;
 volatile LONG g_detectedMapTick = 0;
+volatile LONG g_detectedMapFromCacheSeed = 0;
+volatile LONG g_detectedMapCacheAssociationPending = 0;
 volatile LONG g_direct3D9ActiveOverlayMapIndex = -1;
 volatile LONG g_detectedMapLogCount = 0;
 volatile LONG g_detectedMapCacheRefreshTick = 0;
@@ -658,6 +694,82 @@ bool sameFileName(const std::string& left, const std::string& right) {
     return sameAsciiText(fileNameOnlyFromPath(left), fileNameOnlyFromPath(right));
 }
 
+bool fileExists(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::string sha256FileHex(const std::string& path) {
+    if (!fileExists(path)) {
+        return {};
+    }
+
+    HANDLE file = CreateFileA(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+    std::string result;
+    if (CryptAcquireContextA(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)
+        && CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) {
+        std::array<BYTE, 32768> buffer = {};
+        DWORD bytesRead = 0;
+        bool ok = true;
+        while (true) {
+            if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)) {
+                ok = false;
+                break;
+            }
+            if (bytesRead == 0) {
+                break;
+            }
+            if (!CryptHashData(hash, buffer.data(), bytesRead, 0)) {
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok) {
+            std::array<BYTE, 32> digest = {};
+            DWORD digestSize = static_cast<DWORD>(digest.size());
+            if (CryptGetHashParam(hash, HP_HASHVAL, digest.data(), &digestSize, 0)) {
+                std::ostringstream stream;
+                stream << std::hex << std::setfill('0');
+                for (DWORD index = 0; index < digestSize; ++index) {
+                    stream << std::setw(2) << static_cast<unsigned int>(digest[index]);
+                }
+                result = stream.str();
+            }
+        }
+    }
+
+    if (hash != 0) {
+        CryptDestroyHash(hash);
+    }
+    if (provider != 0) {
+        CryptReleaseContext(provider, 0);
+    }
+    CloseHandle(file);
+    return result;
+}
+
+bool sameSha256(const std::string& left, const std::string& right) {
+    return !left.empty() && !right.empty() && sameAsciiText(left, right);
+}
+
 bool endsWithAscii(const std::string& value, const char* suffix) {
     const std::string lowerValue = lowerAscii(value);
     const std::string lowerSuffix = lowerAscii(suffix);
@@ -678,24 +790,56 @@ bool pathLooksLikeUserSavedLevel(const std::string& path) {
         || normalized.find("/user/savedlevels/") != std::string::npos;
 }
 
-bool direct3D9OverlayCatalogHasFileName(const std::string& fileName) {
+bool direct3D9OverlayCatalogHasFileName(const std::string& mapPath) {
+    const std::string candidateHash = sha256FileHex(mapPath);
+    bool hasHashConstrainedCandidate = false;
     for (const WaOverlayMap& map : g_direct3D9OverlayMaps) {
-        if (sameFileName(map.fileName, fileName)) {
+        if (!sameFileName(map.fileName, mapPath)) {
+            continue;
+        }
+
+        if (!map.sha256.empty()) {
+            hasHashConstrainedCandidate = true;
+            if (!candidateHash.empty() && sameSha256(map.sha256, candidateHash)) {
+                return true;
+            }
+            continue;
+        }
+
+        if (candidateHash.empty()) {
             return true;
         }
     }
 
+    (void)hasHashConstrainedCandidate;
     return false;
 }
 
-bool direct3D9OverlayMapIndexForFileName(const std::string& fileName, std::size_t& index) {
+bool direct3D9OverlayMapIndexForFileName(const std::string& mapPath, std::size_t& index) {
+    const std::string candidateHash = sha256FileHex(mapPath);
+    bool hasHashConstrainedCandidate = false;
     for (std::size_t candidateIndex = 0; candidateIndex < g_direct3D9OverlayMaps.size(); ++candidateIndex) {
-        if (sameFileName(g_direct3D9OverlayMaps[candidateIndex].fileName, fileName)) {
+        const WaOverlayMap& map = g_direct3D9OverlayMaps[candidateIndex];
+        if (!sameFileName(map.fileName, mapPath)) {
+            continue;
+        }
+
+        if (!map.sha256.empty()) {
+            hasHashConstrainedCandidate = true;
+            if (!candidateHash.empty() && sameSha256(map.sha256, candidateHash)) {
+                index = candidateIndex;
+                return true;
+            }
+            continue;
+        }
+
+        if (candidateHash.empty()) {
             index = candidateIndex;
             return true;
         }
     }
 
+    (void)hasHashConstrainedCandidate;
     return false;
 }
 
@@ -718,30 +862,49 @@ void writeDetectedMapCache(const std::string& path, const std::string& fileName,
         return;
     }
 
+    const std::string mapSha256 = hasMetadata ? sha256FileHex(path) : "";
+    const bool canCacheMetadata = hasMetadata && !mapSha256.empty();
     WritePrivateProfileStringA(
         "Map",
         "LastHasMetadata",
-        hasMetadata ? "1" : "0",
+        canCacheMetadata ? "1" : "0",
+        g_detectedMapCachePath.c_str());
+    WritePrivateProfileStringA(
+        "Map",
+        "CacheFormatVersion",
+        canCacheMetadata ? "2" : "",
         g_detectedMapCachePath.c_str());
     WritePrivateProfileStringA(
         "Map",
         "LastPath",
-        path.c_str(),
+        canCacheMetadata ? path.c_str() : "",
         g_detectedMapCachePath.c_str());
     WritePrivateProfileStringA(
         "Map",
         "LastFile",
-        fileName.c_str(),
+        canCacheMetadata ? fileName.c_str() : "",
+        g_detectedMapCachePath.c_str());
+    WritePrivateProfileStringA(
+        "Map",
+        "SourceMapSha256",
+        mapSha256.c_str(),
         g_detectedMapCachePath.c_str());
 
-    const std::uint64_t customDatTime = fileWriteTimeUtc(g_customDatPath);
+    const std::uint64_t customDatTime = canCacheMetadata ? fileWriteTimeUtc(g_customDatPath) : 0;
     const std::string customDatTimeText = customDatTime != 0 ? std::to_string(customDatTime) : "";
+    const std::string customDatSha256 = canCacheMetadata ? sha256FileHex(g_customDatPath) : "";
     WritePrivateProfileStringA(
         "Map",
         "CustomDatWriteTimeUtc",
         customDatTimeText.c_str(),
         g_detectedMapCachePath.c_str());
+    WritePrivateProfileStringA(
+        "Map",
+        "CustomDatSha256",
+        customDatSha256.c_str(),
+        g_detectedMapCachePath.c_str());
     g_detectedMapCachedCustomDatWriteTime = customDatTime;
+    g_detectedMapCachedCustomDatSha256 = customDatSha256;
 }
 
 std::string wideToActiveCodePage(LPCWSTR value) {
@@ -769,27 +932,32 @@ void recordDetectedWaMapFilePath(const std::string& path) {
         return;
     }
 
-    if (!pathLooksLikeUserSavedLevel(path) && !direct3D9OverlayCatalogHasFileName(fileName)) {
+    if (!pathLooksLikeUserSavedLevel(path) && !direct3D9OverlayCatalogHasFileName(path)) {
         return;
     }
 
     std::size_t metadataMapIndex = 0;
-    const bool hasWallMetadata = direct3D9OverlayMapIndexForFileName(fileName, metadataMapIndex);
+    const bool hasWallMetadata = direct3D9OverlayMapIndexForFileName(path, metadataMapIndex);
     const DWORD now = GetTickCount();
     {
         std::lock_guard<std::mutex> lock(g_detectedMapMutex);
         if (sameAsciiText(g_detectedMapPath, path)) {
             InterlockedExchange(&g_detectedMapTick, static_cast<LONG>(now));
+            InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
             return;
         }
 
         g_detectedMapPath = path;
         g_detectedMapFileName = fileName;
         InterlockedExchange(&g_detectedMapTick, static_cast<LONG>(now));
+        InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
+        InterlockedExchange(&g_detectedMapCacheAssociationPending, hasWallMetadata ? 1 : 0);
     }
 
     InterlockedIncrement(&g_detectedMapSequence);
-    writeDetectedMapCache(path, fileName, hasWallMetadata);
+    if (!hasWallMetadata) {
+        writeDetectedMapCache("", "", false);
+    }
 
     if (g_runtimeProbeLogger != nullptr && g_detectedMapLogCount < 32) {
         InterlockedIncrement(&g_detectedMapLogCount);
@@ -1032,6 +1200,164 @@ LONG readWaObjectLong(void* owner, std::uintptr_t offset) {
     return tryReadLong(address, value) ? value : 0;
 }
 
+std::size_t touchedOverlayWallCount();
+std::size_t resetTouchedOverlayWallsForNewTurn();
+void clearActiveWormCandidateForTurnChange();
+void resetCollisionDiagnosticLogWindows();
+
+const char* waTaskMessageName(std::uint32_t messageType) {
+    switch (messageType) {
+    case 7:
+        return "CrateCollected";
+    case 49:
+        return "StartTurn";
+    case 50:
+        return "PauseTurn";
+    case 51:
+        return "ResumeTurn";
+    case 52:
+        return "FinishTurn";
+    case 53:
+        return "TurnStarted";
+    case 54:
+        return "TurnFinished";
+    case 57:
+        return "RetreatStarted";
+    case 58:
+        return "RetreatFinished";
+    case 60:
+        return "SetWorm";
+    case 73:
+        return "WeaponFinished";
+    default:
+        return "other";
+    }
+}
+
+bool waTaskMessageLooksTurnRelated(std::uint32_t messageType) {
+    switch (messageType) {
+    case 49:
+    case 52:
+    case 53:
+    case 54:
+    case 57:
+    case 58:
+    case 60:
+        return true;
+    default:
+        return false;
+    }
+}
+
+LONG readTurnGameLong(void* turnGame, std::uintptr_t offset) {
+    if (turnGame == nullptr) {
+        return 0;
+    }
+
+    LONG value = 0;
+    const auto address = reinterpret_cast<std::uintptr_t>(turnGame) + offset;
+    return tryReadLong(address, value) ? value : 0;
+}
+
+void logTurnGameMessageProbe(
+    const char* phase,
+    void* turnGame,
+    void* sender,
+    std::uint32_t messageType,
+    std::size_t dataSize,
+    void* data,
+    int result) {
+    if (g_runtimeProbeLogger == nullptr || !waTaskMessageLooksTurnRelated(messageType)) {
+        return;
+    }
+
+    const LONG logCount = InterlockedIncrement(&g_turnGameHandleMessageLogCount);
+    if (logCount > 160) {
+        return;
+    }
+
+    const LONG teamA = readTurnGameLong(turnGame, 0x12C);
+    const LONG teamB = readTurnGameLong(turnGame, 0x134);
+    const LONG beforeRoundStart = readTurnGameLong(turnGame, 0x140);
+    const LONG turnPaused = readTurnGameLong(turnGame, 0x150);
+    const LONG retreatTimer = readTurnGameLong(turnGame, 0x178);
+    const LONG roundTimer = readTurnGameLong(turnGame, 0x184);
+    const LONG turnTimerA = readTurnGameLong(turnGame, 0x188);
+    const LONG turnTimerB = readTurnGameLong(turnGame, 0x18C);
+
+    LONG data0 = 0;
+    const bool hasData0 = data != nullptr && dataSize >= sizeof(LONG)
+        && tryReadLong(reinterpret_cast<std::uintptr_t>(data), data0);
+
+    std::ostringstream message;
+    message << "runtime probe: CTaskTurnGame::HandleMessage " << phase
+            << " type " << messageType
+            << " (" << waTaskMessageName(messageType) << ")"
+            << " result " << result
+            << " this " << formatAddress(reinterpret_cast<std::uintptr_t>(turnGame))
+            << " sender " << formatAddress(reinterpret_cast<std::uintptr_t>(sender))
+            << " size " << dataSize
+            << " data " << formatAddress(reinterpret_cast<std::uintptr_t>(data));
+    if (hasData0) {
+        message << " data0 " << data0;
+    }
+    message << " team12C " << teamA
+            << " team134 " << teamB
+            << " beforeRound " << beforeRoundStart
+            << " paused " << turnPaused
+            << " retreatTimer " << retreatTimer
+            << " roundTimer " << roundTimer
+            << " turnTimer188 " << turnTimerA
+            << " turnTimer18C " << turnTimerB
+            << " touchedWalls " << touchedOverlayWallCount();
+    g_runtimeProbeLogger->info(message.str());
+}
+
+void resetTouchedOverlayWallsForTurnGameFinishTurn(void* turnGame, void* data, std::size_t dataSize) {
+    if (touchedOverlayWallCount() == 0) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    const DWORD lastResetTick = static_cast<DWORD>(g_turnGameFinishTurnLastResetTick);
+    if (lastResetTick != 0 && now - lastResetTick < kTurnGameFinishTurnResetDebounceMilliseconds) {
+        return;
+    }
+
+    LONG data0 = 0;
+    const bool hasData0 = data != nullptr && dataSize >= sizeof(LONG)
+        && tryReadLong(reinterpret_cast<std::uintptr_t>(data), data0);
+    const LONG teamA = readTurnGameLong(turnGame, 0x12C);
+    const LONG teamB = readTurnGameLong(turnGame, 0x134);
+
+    clearActiveWormCandidateForTurnChange();
+    const std::size_t resetCount = resetTouchedOverlayWallsForNewTurn();
+    if (resetCount == 0) {
+        return;
+    }
+
+    InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(now));
+    InterlockedExchange(&g_turnGameFinishTurnLastResetTick, static_cast<LONG>(now));
+
+    if (g_runtimeProbeLogger != nullptr && g_wallTouchResetLogCount < 32) {
+        InterlockedIncrement(&g_wallTouchResetLogCount);
+
+        std::ostringstream message;
+        message << "runtime probe: wall touch state reset for CTaskTurnGame FinishTurn";
+        if (hasData0) {
+            message << " data0 " << data0;
+        }
+        message << " team12C "
+                << teamA
+                << " team134 "
+                << teamB
+                << ", reset "
+                << resetCount
+                << " touched wall(s)";
+        g_runtimeProbeLogger->info(message.str());
+    }
+}
+
 bool tryReadByte(std::uintptr_t address, BYTE& value) {
     if (!isReadableMemoryRange(address, sizeof(BYTE))) {
         return false;
@@ -1168,64 +1494,6 @@ bool tryReadCurrentActiveTeamByteFromStateUi(std::uintptr_t stateUiAddress, BYTE
     return tryReadByte(stateUiAddress + kWaCurrentTeamByteOffset, activeTeamByte);
 }
 
-bool tryReadCachedActiveTeamByte(BYTE& activeTeamByte) {
-    const LONG stateUiAddressLong = g_waStateUiAddress;
-    if (stateUiAddressLong == 0) {
-        return false;
-    }
-
-    const auto stateUiAddress = static_cast<std::uintptr_t>(
-        static_cast<std::uint32_t>(stateUiAddressLong));
-    if (tryReadCurrentActiveTeamByteFromStateUi(stateUiAddress, activeTeamByte)) {
-        return true;
-    }
-
-    InterlockedExchange(&g_waStateUiAddress, 0);
-    return false;
-}
-
-bool tryReadCurrentActiveTeamByteFromOwner(std::uintptr_t ownerAddress, BYTE& activeTeamByte) {
-    std::uintptr_t stateUiAddress = 0;
-    if (!tryReadStateUiAddressFromOwner(ownerAddress, stateUiAddress)) {
-        return false;
-    }
-
-    if (!tryReadCurrentActiveTeamByteFromStateUi(stateUiAddress, activeTeamByte)) {
-        return false;
-    }
-
-    rememberWaStateUiAddress(stateUiAddress);
-    return true;
-}
-
-bool currentActiveTeamByteFromKnownWormSamples(BYTE& activeTeamByte) {
-    if (tryReadCachedActiveTeamByte(activeTeamByte)) {
-        return true;
-    }
-
-    const DWORD now = GetTickCount();
-
-    for (const WormLiveSample& sample : g_wormLiveSamples) {
-        const LONG ownerAddressLong = sample.ownerAddress;
-        if (ownerAddressLong == 0) {
-            continue;
-        }
-
-        const DWORD sampleTick = static_cast<DWORD>(
-            sample.lastPollTick != 0 ? sample.lastPollTick : sample.tick);
-        if (sampleTick != 0 && now - sampleTick > 30000) {
-            continue;
-        }
-
-        const auto ownerAddress = static_cast<std::uintptr_t>(ownerAddressLong);
-        if (tryReadCurrentActiveTeamByteFromOwner(ownerAddress, activeTeamByte)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 void clearActiveWormCandidateForTurnChange() {
     InterlockedExchange(&g_activeWormCandidateOwnerAddress, 0);
     InterlockedExchange(&g_activeWormCandidateBaseAddress, 0);
@@ -1236,8 +1504,8 @@ void clearActiveWormCandidateForTurnChange() {
     InterlockedExchange(&g_activeWormCandidateSourceOffset, 0);
     InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
     InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
-    InterlockedExchange(&g_wallTouchTurnFallbackTouchTick, 0);
     InterlockedExchange(&g_wallTouchLastTouchTick, 0);
+    resetCollisionDiagnosticLogWindows();
 }
 
 void clearActiveWormCoordinateCandidateForReselection() {
@@ -1251,141 +1519,79 @@ void clearActiveWormCoordinateCandidateForReselection() {
     InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
 }
 
-void resetTouchedOverlayWallsWhenActiveTeamChanges() {
-    BYTE activeTeamByte = 0;
-    if (!currentActiveTeamByteFromKnownWormSamples(activeTeamByte)) {
-        return;
-    }
-
-    const LONG activeTeamLong = static_cast<LONG>(activeTeamByte);
-    const LONG previousTeamLong = InterlockedExchange(&g_wallTouchTurnTeamByte, activeTeamLong);
-    if (previousTeamLong == kUnknownWallTouchTurnTeamByte || previousTeamLong == activeTeamLong) {
-        return;
-    }
-
-    clearActiveWormCandidateForTurnChange();
-    const std::size_t resetCount = resetTouchedOverlayWallsForNewTurn();
-    if (resetCount == 0) {
-        return;
-    }
-
-    InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(GetTickCount()));
-
-    if (g_runtimeProbeLogger != nullptr && g_wallTouchResetLogCount < 32) {
-        InterlockedIncrement(&g_wallTouchResetLogCount);
-
-        std::ostringstream message;
-        message << "runtime probe: wall touch state reset for active team change from "
-                << previousTeamLong
-                << " to "
-                << activeTeamLong
-                << ", reset "
-                << resetCount
-                << " touched wall(s)";
-        g_runtimeProbeLogger->info(message.str());
-    }
+void resetCollisionQueryCommonLogWindow() {
+    InterlockedExchange(&g_jumpTerrainCollisionResultProbeHits, 0);
+    InterlockedExchange(&g_jumpTerrainCollisionResultLogCount, 0);
+    InterlockedExchange(&g_jumpTerrainCollisionResultNearWallLogCount, 0);
+    InterlockedExchange(&g_jumpTerrainCollisionResultLogCount, 0);
+    InterlockedExchange(&g_jumpTerrainCollisionResultNearWallLogCount, 0);
 }
 
-void resetTouchedOverlayWallsWhenActiveOwnerChanges(std::uintptr_t ownerAddress) {
-    if (ownerAddress == 0) {
-        return;
-    }
-
-    BYTE activeTeamByte = 0;
-    if (tryReadCurrentActiveTeamByteFromOwner(ownerAddress, activeTeamByte)) {
-        InterlockedExchange(&g_wallTouchTurnTeamByte, static_cast<LONG>(activeTeamByte));
-    }
-
-    const LONG ownerAddressLong = static_cast<LONG>(ownerAddress);
-    const LONG previousOwnerAddress = g_wallTouchTurnOwnerAddress;
-    if (previousOwnerAddress == ownerAddressLong) {
-        return;
-    }
-
-    InterlockedExchange(&g_wallTouchTurnOwnerAddress, ownerAddressLong);
-    if (previousOwnerAddress == 0) {
-        return;
-    }
-
-    if (previousOwnerAddress == kFallbackWallTouchTurnOwnerAddress) {
-        const DWORD fallbackTouchTick = static_cast<DWORD>(g_wallTouchTurnFallbackTouchTick);
-        if (fallbackTouchTick != 0
-            && GetTickCount() - fallbackTouchTick < kTrackingFallbackTurnResetMinAgeMilliseconds) {
-            return;
-        }
-    }
-
-    InterlockedExchange(&g_wallTouchTurnFallbackTouchTick, 0);
-
-    const std::size_t resetCount = resetTouchedOverlayWallsForNewTurn();
-    if (resetCount == 0) {
-        return;
-    }
-
-    InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(GetTickCount()));
-
-    if (g_runtimeProbeLogger != nullptr && g_wallTouchResetLogCount < 32) {
-        InterlockedIncrement(&g_wallTouchResetLogCount);
-
-        std::ostringstream message;
-        message << "runtime probe: wall touch state reset for "
-                << (previousOwnerAddress == kFallbackWallTouchTurnOwnerAddress
-                    ? "fallback tracking handoff"
-                    : "active worm change")
-                << " from "
-                << (previousOwnerAddress == kFallbackWallTouchTurnOwnerAddress
-                    ? "fallback"
-                    : formatAddress(static_cast<std::uintptr_t>(static_cast<std::uint32_t>(previousOwnerAddress))))
-                << " to "
-                << formatAddress(ownerAddress)
-                << ", reset "
-                << resetCount
-                << " touched wall(s)";
-        g_runtimeProbeLogger->info(message.str());
-    }
+void resetCollisionDiagnosticLogWindows() {
+    resetCollisionQueryCommonLogWindow();
+    InterlockedExchange(&g_movementResolutionResultLogCount, 0);
+    InterlockedExchange(&g_movementResolutionResultNearWallLogCount, 0);
 }
 
-void resetTouchedOverlayWallsWhenAggregateOwnerLooksLikeNewTurn(std::uintptr_t ownerAddress) {
-    if (ownerAddress == 0 || touchedOverlayWallCount() == 0) {
-        return;
-    }
-
-    const DWORD lastTouchTick = static_cast<DWORD>(g_wallTouchLastTouchTick);
+bool markTouchedOverlayWallFromPhysics(
+    std::size_t wallIndex,
+    std::uintptr_t ownerAddress,
+    int ownerX,
+    int ownerY,
+    int distancePixels,
+    const char* method) {
     const DWORD now = GetTickCount();
-    if (lastTouchTick == 0 || now - lastTouchTick < kAggregateOwnerTurnResetMinAgeMilliseconds) {
-        return;
+    for (Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        if (rect.wallIndex != wallIndex) {
+            continue;
+        }
+
+        if (rect.touched) {
+            return false;
+        }
+
+        rect.touched = true;
+        InterlockedExchange(&g_wallTouchLastTouchTick, static_cast<LONG>(now));
+        if (ownerAddress != 0) {
+            InterlockedCompareExchange(
+                &g_wallTouchTurnOwnerAddress,
+                static_cast<LONG>(ownerAddress),
+                0);
+        }
+
+        if (g_runtimeProbeLogger != nullptr && g_direct3D9WallTouchLogCount < 64) {
+            InterlockedIncrement(&g_direct3D9WallTouchLogCount);
+
+            std::ostringstream message;
+            message << "runtime probe: wall touched by active worm, wall "
+                    << rect.wallIndex
+                    << " method "
+                    << (method != nullptr && method[0] != '\0' ? method : "physics")
+                    << " rect "
+                    << rect.left
+                    << ","
+                    << rect.top
+                    << "-"
+                    << rect.right
+                    << ","
+                    << rect.bottom
+                    << " active "
+                    << ownerX
+                    << ","
+                    << ownerY
+                    << " distance "
+                    << distancePixels
+                    << " activeOwner "
+                    << formatAddress(ownerAddress)
+                    << " turnOwner "
+                    << formatAddress(static_cast<std::uintptr_t>(
+                        static_cast<std::uint32_t>(g_wallTouchTurnOwnerAddress)));
+            g_runtimeProbeLogger->info(message.str());
+        }
+        return true;
     }
 
-    resetTouchedOverlayWallsWhenActiveOwnerChanges(ownerAddress);
-}
-
-void rememberFallbackWallTouchTurn() {
-    if (g_wallTouchTurnOwnerAddress == 0) {
-        InterlockedExchange(&g_wallTouchTurnOwnerAddress, kFallbackWallTouchTurnOwnerAddress);
-    }
-
-    BYTE activeTeamByte = 0;
-    if (currentActiveTeamByteFromKnownWormSamples(activeTeamByte)) {
-        InterlockedExchange(&g_wallTouchTurnTeamByte, static_cast<LONG>(activeTeamByte));
-    }
-
-    InterlockedExchange(&g_wallTouchTurnFallbackTouchTick, static_cast<LONG>(GetTickCount()));
-}
-
-void rememberActiveWallTouchTurn() {
-    if (g_wallTouchTurnOwnerAddress != 0) {
-        return;
-    }
-
-    const LONG ownerAddress = g_activeWormCandidateOwnerAddress;
-    if (ownerAddress != 0) {
-        InterlockedCompareExchange(&g_wallTouchTurnOwnerAddress, ownerAddress, 0);
-    }
-
-    BYTE activeTeamByte = 0;
-    if (currentActiveTeamByteFromKnownWormSamples(activeTeamByte)) {
-        InterlockedExchange(&g_wallTouchTurnTeamByte, static_cast<LONG>(activeTeamByte));
-    }
+    return false;
 }
 
 void publishActiveWormCoordinateCandidate(
@@ -1398,7 +1604,10 @@ void publishActiveWormCoordinateCandidate(
     LONG sourceKind,
     LONG sourceOffset) {
     const std::uintptr_t ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
-    resetTouchedOverlayWallsWhenActiveOwnerChanges(ownerAddress);
+    const LONG previousOwnerAddress = g_activeWormCandidateOwnerAddress;
+    if (previousOwnerAddress != 0 && previousOwnerAddress != static_cast<LONG>(ownerAddress)) {
+        resetCollisionQueryCommonLogWindow();
+    }
 
     InterlockedExchange(&g_activeWormCandidateOwnerAddress, static_cast<LONG>(ownerAddress));
     InterlockedExchange(&g_activeWormCandidateBaseAddress, static_cast<LONG>(baseAddress));
@@ -1512,6 +1721,7 @@ void resetWormLiveSampleTransientHistory(WormLiveSample& sample) {
 
 void resetTransientGameplayTrackingState(const char* reason, bool clearWormSamples) {
     const std::size_t resetWallCount = resetTouchedOverlayWallsForNewTurn();
+    resetCollisionDiagnosticLogWindows();
     if (resetWallCount != 0) {
         InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(GetTickCount()));
     }
@@ -1566,8 +1776,6 @@ void resetTransientGameplayTrackingState(const char* reason, bool clearWormSampl
     InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
     InterlockedExchange(&g_activeWormCandidateScanTick, 0);
     InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
-    InterlockedExchange(&g_wallTouchTurnTeamByte, kUnknownWallTouchTurnTeamByte);
-    InterlockedExchange(&g_wallTouchTurnFallbackTouchTick, 0);
     InterlockedExchange(&g_wallTouchLastTouchTick, 0);
     InterlockedExchange(&g_wallTouchLastResetTick, 0);
     InterlockedExchange(&g_activeWormCandidateLogCount, 0);
@@ -2649,135 +2857,6 @@ bool readActiveWormCandidatePixels(int& xPixels, int& yPixels) {
     return true;
 }
 
-bool readTrackingReferenceSweepPixels(
-    int& olderX,
-    int& olderY,
-    int& previousX,
-    int& previousY,
-    int& currentX,
-    int& currentY,
-    bool& hasOlder,
-    bool& usedTrackingFallback) {
-    usedTrackingFallback = false;
-    if (!currentTrackingReference(currentX, currentY)) {
-        return false;
-    }
-
-    olderX = currentX;
-    olderY = currentY;
-    previousX = currentX;
-    previousY = currentY;
-    hasOlder = false;
-
-    const LONG historyCount = g_trackingTargetReferenceHistoryCount;
-    if (historyCount >= 2) {
-        previousX = static_cast<int>(g_trackingTargetReferencePreviousX);
-        previousY = static_cast<int>(g_trackingTargetReferencePreviousY);
-    }
-
-    if (historyCount >= 3) {
-        olderX = static_cast<int>(g_trackingTargetReferenceOlderX);
-        olderY = static_cast<int>(g_trackingTargetReferenceOlderY);
-        hasOlder = true;
-    } else {
-        olderX = previousX;
-        olderY = previousY;
-    }
-
-    usedTrackingFallback = true;
-
-    if (g_runtimeProbeLogger != nullptr && g_trackingTargetFallbackLogCount < 16) {
-        InterlockedIncrement(&g_trackingTargetFallbackLogCount);
-
-        std::ostringstream message;
-        message << "runtime probe: active worm fallback from W:A tracking reference current "
-                << currentX
-                << ","
-                << currentY
-                << " previous "
-                << previousX
-                << ","
-                << previousY
-                << " older "
-                << olderX
-                << ","
-                << olderY
-                << " history "
-                << historyCount;
-        g_runtimeProbeLogger->info(message.str());
-    }
-
-    return true;
-}
-
-bool readActiveWormCandidateSweepPixels(
-    int& olderX,
-    int& olderY,
-    int& previousX,
-    int& previousY,
-    int& currentX,
-    int& currentY,
-    bool& hasOlder,
-    bool& usedTrackingFallback) {
-    usedTrackingFallback = false;
-    if (!readActiveWormCandidatePixels(currentX, currentY)) {
-        return readTrackingReferenceSweepPixels(
-            olderX,
-            olderY,
-            previousX,
-            previousY,
-            currentX,
-            currentY,
-            hasOlder,
-            usedTrackingFallback);
-    }
-
-    olderX = currentX;
-    olderY = currentY;
-    previousX = currentX;
-    previousY = currentY;
-    hasOlder = false;
-
-    const auto ownerAddress = static_cast<std::uintptr_t>(g_activeWormCandidateOwnerAddress);
-    const WormLiveSample* sample = findWormLiveSampleByOwner(ownerAddress);
-    if (sample == nullptr || sample->primaryValid == 0) {
-        return true;
-    }
-
-    const DWORD pollTick = static_cast<DWORD>(sample->lastPollTick);
-    const DWORD now = GetTickCount();
-    if (pollTick == 0 || now - pollTick > 3000) {
-        return true;
-    }
-
-    const LONG historyCount = sample->primaryHistoryCount;
-    if (historyCount <= 0) {
-        return true;
-    }
-
-    currentX = static_cast<int>(sample->primaryXPixels);
-    currentY = static_cast<int>(sample->primaryYPixels);
-
-    if (historyCount >= 2) {
-        previousX = static_cast<int>(sample->previousPrimaryXPixels);
-        previousY = static_cast<int>(sample->previousPrimaryYPixels);
-    } else {
-        previousX = currentX;
-        previousY = currentY;
-    }
-
-    if (historyCount >= 3) {
-        olderX = static_cast<int>(sample->olderPrimaryXPixels);
-        olderY = static_cast<int>(sample->olderPrimaryYPixels);
-        hasOlder = true;
-    } else {
-        olderX = previousX;
-        olderY = previousY;
-    }
-
-    return true;
-}
-
 void invalidateActiveWormCoordinateCandidate() {
     InterlockedExchange(&g_activeWormCandidateOffsetValid, 0);
     InterlockedExchange(&g_activeWormCandidateBaseAddress, 0);
@@ -2862,8 +2941,6 @@ void maybeUpdateActiveWormCoordinateOffsets(void* owner, LONG xFixed, LONG yFixe
         && g_activeWormCandidateSourceKind == 4) {
         return;
     }
-
-    resetTouchedOverlayWallsWhenAggregateOwnerLooksLikeNewTurn(reinterpret_cast<std::uintptr_t>(owner));
 
     const LONG previousOwner = g_activeWormCandidateOwnerAddress;
     if (previousOwner != 0 && previousOwner != static_cast<LONG>(reinterpret_cast<std::uintptr_t>(owner))) {
@@ -3289,6 +3366,592 @@ extern "C" void __cdecl recordWaWormMotionCandidateOwner(void* owner) noexcept {
     }
 }
 
+extern "C" void __cdecl recordWaJumpTerrainCollisionResult(
+    void* owner,
+    LONG xFixed,
+    LONG yFixed,
+    LONG collisionResult) noexcept {
+    const LONG hits = InterlockedIncrement(&g_jumpTerrainCollisionResultProbeHits);
+    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
+    if (owner == nullptr || g_direct3D9OverlayTestRects.empty()) {
+        return;
+    }
+
+    LONG objectKind = 0;
+    LONG teamIndex = 0;
+    LONG wormIndex = 0;
+    LONG velocityX = 0;
+    LONG velocityY = 0;
+    const bool readObjectKind = tryReadLong(ownerAddress + kWaObjectKindOffset, objectKind);
+    const bool readTeamIndex = tryReadLong(ownerAddress + kWaObjectTeamOffset, teamIndex);
+    const bool readWormIndex = tryReadLong(ownerAddress + kWaObjectWormOffset, wormIndex);
+    const bool readVelocityX = tryReadLong(ownerAddress + 0x90, velocityX);
+    const bool readVelocityY = tryReadLong(ownerAddress + 0x94, velocityY);
+    if (!readObjectKind || !readTeamIndex || !readWormIndex || !readVelocityX || !readVelocityY) {
+        return;
+    }
+
+    const int xPixels = fixedDeltaToPixels(xFixed);
+    const int yPixels = fixedDeltaToPixels(yFixed);
+    const bool mapCoordinate = candidateLooksLikeMapCoordinate(xFixed, yFixed);
+    const bool currentTeamMatches = waObjectCurrentTeamMatches(owner);
+    const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
+    const bool activeCandidateMatches =
+        activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
+    const LONG turnOwnerAddress = g_wallTouchTurnOwnerAddress;
+    const bool turnOwnerMatches =
+        turnOwnerAddress != 0 && turnOwnerAddress == static_cast<LONG>(ownerAddress);
+
+    constexpr int kJumpTerrainResultWallMarginPixels = 16;
+    constexpr int kJumpTerrainHitMaxSquaredDistance = 36;
+    for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        if (xPixels < rect.left - kJumpTerrainResultWallMarginPixels
+            || xPixels > rect.right + kJumpTerrainResultWallMarginPixels
+            || yPixels < rect.top - kJumpTerrainResultWallMarginPixels
+            || yPixels > rect.bottom + kJumpTerrainResultWallMarginPixels) {
+            continue;
+        }
+
+        const int closestX = std::clamp<int>(
+            xPixels,
+            static_cast<int>(rect.left),
+            static_cast<int>(rect.right));
+        const int closestY = std::clamp<int>(
+            yPixels,
+            static_cast<int>(rect.top),
+            static_cast<int>(rect.bottom));
+        const int dx = std::abs(xPixels - closestX);
+        const int dy = std::abs(yPixels - closestY);
+        const int wallDistance = std::max(dx, dy);
+        const int squaredWallDistance = (dx * dx) + (dy * dy);
+        const bool jumpTerrainHit =
+            collisionResult != 0
+            && mapCoordinate
+            && (activeCandidateMatches || turnOwnerMatches)
+            && squaredWallDistance <= kJumpTerrainHitMaxSquaredDistance;
+
+        if (jumpTerrainHit) {
+            markTouchedOverlayWallFromPhysics(
+                rect.wallIndex,
+                ownerAddress,
+                xPixels,
+                yPixels,
+                wallDistance,
+                "jump-terrain-collision");
+        }
+
+        if (g_runtimeProbeLogger != nullptr && g_jumpTerrainCollisionResultLogCount < 96) {
+            InterlockedIncrement(&g_jumpTerrainCollisionResultLogCount);
+
+            std::ostringstream message;
+            message << "runtime probe: jump terrain collision result near wall "
+                    << rect.wallIndex
+                    << " owner "
+                    << formatAddress(ownerAddress)
+                    << " objectKind "
+                    << objectKind
+                    << " team "
+                    << teamIndex
+                    << " worm "
+                    << wormIndex
+                    << " currentTeam "
+                    << (currentTeamMatches ? "yes" : "no")
+                    << " activeCandidate "
+                    << (activeCandidateMatches ? "yes" : "no")
+                    << " turnOwner "
+                    << (turnOwnerMatches ? "yes" : "no")
+                    << " queryFixed "
+                    << xFixed
+                    << ","
+                    << yFixed
+                    << " queryPixels "
+                    << xPixels
+                    << ","
+                    << yPixels
+                    << " velocity "
+                    << fixedDeltaToPixels(velocityX)
+                    << ","
+                    << fixedDeltaToPixels(velocityY)
+                    << " result "
+                    << collisionResult
+                    << " rect "
+                    << rect.left
+                    << ","
+                    << rect.top
+                    << "-"
+                    << rect.right
+                    << ","
+                    << rect.bottom
+                    << " distance "
+                    << wallDistance
+                    << " squaredDistance "
+                    << squaredWallDistance
+                    << " jumpTerrainHit "
+                    << (jumpTerrainHit ? "yes" : "no")
+                    << " total hits "
+                    << hits;
+            g_runtimeProbeLogger->info(message.str());
+        }
+        return;
+    }
+}
+
+extern "C" void __cdecl recordWaMovementResolutionResult(
+    void* owner,
+    LONG result,
+    LONG siteRva) noexcept {
+    const LONG hits = InterlockedIncrement(&g_movementResolutionResultProbeHits);
+    if (owner == nullptr || g_direct3D9OverlayTestRects.empty()) {
+        return;
+    }
+
+    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
+    LONG ownerKind = 0;
+    LONG ownerTeam = 0;
+    LONG ownerWorm = 0;
+    LONG ownerXFixed = 0;
+    LONG ownerYFixed = 0;
+    LONG velocityXFixed = 0;
+    LONG velocityYFixed = 0;
+    LONG stateAc = 0;
+    LONG stateB0 = 0;
+    LONG stateB4 = 0;
+    LONG stateB8 = 0;
+    LONG stateBc = 0;
+    const bool readOwnerKind = tryReadLong(ownerAddress + kWaObjectKindOffset, ownerKind);
+    const bool readOwnerTeam = tryReadLong(ownerAddress + kWaObjectTeamOffset, ownerTeam);
+    const bool readOwnerWorm = tryReadLong(ownerAddress + kWaObjectWormOffset, ownerWorm);
+    const bool readOwnerX = tryReadLong(ownerAddress + kWaObjectPrimaryXOffset, ownerXFixed);
+    const bool readOwnerY = tryReadLong(ownerAddress + kWaObjectPrimaryYOffset, ownerYFixed);
+    const bool readVelocityX = tryReadLong(ownerAddress + 0x90, velocityXFixed);
+    const bool readVelocityY = tryReadLong(ownerAddress + 0x94, velocityYFixed);
+    tryReadLong(ownerAddress + 0xAC, stateAc);
+    tryReadLong(ownerAddress + 0xB0, stateB0);
+    tryReadLong(ownerAddress + 0xB4, stateB4);
+    tryReadLong(ownerAddress + 0xB8, stateB8);
+    tryReadLong(ownerAddress + 0xBC, stateBc);
+
+    const bool looksLikeWorm = readOwnerKind
+        && (waObjectKindLooksLikeWorm(ownerKind) || ownerKind == 102 || ownerKind == 121 || ownerKind == 123 || ownerKind == 127);
+    const bool currentTeamMatches = waObjectCurrentTeamMatches(owner);
+    const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
+    const bool activeCandidateMatches =
+        activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
+    const LONG turnOwnerAddress = g_wallTouchTurnOwnerAddress;
+    const bool turnOwnerMatches =
+        turnOwnerAddress != 0 && turnOwnerAddress == static_cast<LONG>(ownerAddress);
+    const int ownerXPixels = readOwnerX ? fixedDeltaToPixels(ownerXFixed) : -9999;
+    const int ownerYPixels = readOwnerY ? fixedDeltaToPixels(ownerYFixed) : -9999;
+    const int velocityXPixels = readVelocityX ? fixedDeltaToPixels(velocityXFixed) : -9999;
+    const int velocityYPixels = readVelocityY ? fixedDeltaToPixels(velocityYFixed) : -9999;
+
+    if (!looksLikeWorm || !readOwnerX || !readOwnerY) {
+        return;
+    }
+
+    int nearestWall = -1;
+    int nearestDistance = 999999;
+    for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        const int dx = ownerXPixels < rect.left ? rect.left - ownerXPixels
+            : ownerXPixels > rect.right ? ownerXPixels - rect.right
+                                       : 0;
+        const int dy = ownerYPixels < rect.top ? rect.top - ownerYPixels
+            : ownerYPixels > rect.bottom ? ownerYPixels - rect.bottom
+                                        : 0;
+        const int distance = std::max(dx, dy);
+        if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearestWall = static_cast<int>(rect.wallIndex);
+        }
+    }
+
+    constexpr int kMovementResolutionNearWallPixels = 96;
+    if (nearestWall < 0 || nearestDistance > kMovementResolutionNearWallPixels) {
+        return;
+    }
+
+    constexpr int kMovementResolutionTouchDistancePixels = 5;
+    const bool movementResolutionHit =
+        siteRva == static_cast<LONG>(kWa381MovementResolutionSecondaryResultRva)
+        && result != 0
+        && ownerKind == 121
+        && (activeCandidateMatches || turnOwnerMatches)
+        && nearestDistance <= kMovementResolutionTouchDistancePixels;
+
+    if (movementResolutionHit) {
+        markTouchedOverlayWallFromPhysics(
+            static_cast<std::size_t>(nearestWall),
+            ownerAddress,
+            ownerXPixels,
+            ownerYPixels,
+            nearestDistance,
+            "movement-resolution-collision");
+    }
+
+    InterlockedIncrement(&g_movementResolutionResultNearWallLogCount);
+    if (g_runtimeProbeLogger == nullptr || g_movementResolutionResultLogCount >= 220) {
+        return;
+    }
+    InterlockedIncrement(&g_movementResolutionResultLogCount);
+
+    std::ostringstream message;
+    message << "runtime probe: movement resolution result rva "
+            << formatAddress(static_cast<std::uintptr_t>(static_cast<std::uint32_t>(siteRva)))
+            << " result "
+            << formatAddress(static_cast<std::uintptr_t>(static_cast<std::uint32_t>(result)))
+            << " resultNonZero "
+            << (result != 0 ? "yes" : "no")
+            << " owner "
+            << formatAddress(ownerAddress)
+            << " ownerKind "
+            << (readOwnerKind ? ownerKind : -9999)
+            << " ownerTeam "
+            << (readOwnerTeam ? ownerTeam : -9999)
+            << " ownerWorm "
+            << (readOwnerWorm ? ownerWorm : -9999)
+            << " currentTeam "
+            << (currentTeamMatches ? "yes" : "no")
+            << " activeCandidate "
+            << (activeCandidateMatches ? "yes" : "no")
+            << " turnOwner "
+            << (turnOwnerMatches ? "yes" : "no")
+            << " ownerPixels "
+            << ownerXPixels
+            << ","
+            << ownerYPixels
+            << " velocity "
+            << velocityXPixels
+            << ","
+            << velocityYPixels
+            << " wall "
+            << nearestWall
+            << " distance "
+            << nearestDistance
+            << " states ac/b0/b4/b8/bc "
+            << stateAc
+            << "/"
+            << stateB0
+            << "/"
+            << stateB4
+            << "/"
+            << stateB8
+            << "/"
+            << stateBc
+            << " total hits "
+            << hits;
+    g_runtimeProbeLogger->info(message.str());
+}
+
+extern "C" void __cdecl recordWaMovementCollisionResult(
+    void* owner,
+    LONG xFixed,
+    LONG yFixed,
+    LONG collisionResult) noexcept {
+    InterlockedIncrement(&g_movementCollisionResultProbeHits);
+    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
+    const int xPixels = fixedDeltaToPixels(xFixed);
+    const int yPixels = fixedDeltaToPixels(yFixed);
+    const bool mapCoordinate = candidateLooksLikeMapCoordinate(xFixed, yFixed);
+
+    LONG objectKind = 0;
+    const bool readObjectKind = owner != nullptr && tryReadLong(ownerAddress + kWaObjectKindOffset, objectKind);
+    const bool looksLikeWorm = readObjectKind && waObjectKindLooksLikeWorm(objectKind);
+    const bool activeCandidateMatches =
+        g_activeWormCandidateOwnerAddress == static_cast<LONG>(ownerAddress);
+
+    const bool physicsOwnerLooksLikeWorm =
+        looksLikeWorm || objectKind == 102 || objectKind == 123 || objectKind == 127;
+    if (owner == nullptr
+        || !physicsOwnerLooksLikeWorm
+        || !mapCoordinate
+        || g_direct3D9OverlayTestRects.empty()) {
+        return;
+    }
+
+    constexpr int kMovementCollisionWallMarginPixels = 96;
+    for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        if (xPixels < rect.left - kMovementCollisionWallMarginPixels
+            || xPixels > rect.right + kMovementCollisionWallMarginPixels
+            || yPixels < rect.top - kMovementCollisionWallMarginPixels
+            || yPixels > rect.bottom + kMovementCollisionWallMarginPixels) {
+            continue;
+        }
+
+        const int wallDistance = std::max(
+            xPixels < rect.left ? rect.left - xPixels
+                : xPixels > rect.right ? xPixels - rect.right
+                                       : 0,
+            yPixels < rect.top ? rect.top - yPixels
+                : yPixels > rect.bottom ? yPixels - rect.bottom
+                                        : 0);
+        constexpr int kWormMovementCollisionTouchDistancePixels = 5;
+        const bool ropeMovementCollisionHit =
+            collisionResult != 0
+            && activeCandidateMatches
+            && (objectKind == 101 || objectKind == 123)
+            && wallDistance <= kWormMovementCollisionTouchDistancePixels;
+
+        if (ropeMovementCollisionHit) {
+            markTouchedOverlayWallFromPhysics(
+                rect.wallIndex,
+                ownerAddress,
+                xPixels,
+                yPixels,
+                wallDistance,
+                "rope-movement-collision");
+        }
+        return;
+    }
+}
+
+extern "C" void __cdecl recordWaMovementCollisionPath(void* owner, void* collided) noexcept {
+    InterlockedIncrement(&g_movementCollisionPathProbeHits);
+    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
+    const auto collidedAddress = reinterpret_cast<std::uintptr_t>(collided);
+
+    LONG ownerKind = 0;
+    LONG ownerXFixed = 0;
+    LONG ownerYFixed = 0;
+    LONG collidedKind = 0;
+    const bool readOwnerKind = owner != nullptr && tryReadLong(ownerAddress + kWaObjectKindOffset, ownerKind);
+    const bool readOwnerX = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryXOffset, ownerXFixed);
+    const bool readOwnerY = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryYOffset, ownerYFixed);
+    const bool readCollidedKind = collided != nullptr
+        && tryReadLong(collidedAddress + kWaObjectKindOffset, collidedKind);
+
+    const int ownerXPixels = readOwnerX ? fixedDeltaToPixels(ownerXFixed) : -9999;
+    const int ownerYPixels = readOwnerY ? fixedDeltaToPixels(ownerYFixed) : -9999;
+    const bool looksLikeWorm = readOwnerKind
+        && (waObjectKindLooksLikeWorm(ownerKind) || ownerKind == 102 || ownerKind == 123 || ownerKind == 127 || ownerKind == 128);
+    const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
+    const bool activeCandidateMatches =
+        activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
+    const LONG turnOwnerAddress = g_wallTouchTurnOwnerAddress;
+    const bool turnOwnerMatches =
+        turnOwnerAddress != 0 && turnOwnerAddress == static_cast<LONG>(ownerAddress);
+    const bool currentTeamMatches = waObjectCurrentTeamMatches(owner);
+
+    if (owner == nullptr
+        || !looksLikeWorm
+        || !readOwnerX
+        || !readOwnerY
+        || g_direct3D9OverlayTestRects.empty()) {
+        return;
+    }
+
+    constexpr int kMovementCollisionPathWallMarginPixels = 96;
+    const Direct3D9OverlayRect* closestRect = nullptr;
+    int closestDistancePixels = std::numeric_limits<int>::max();
+    for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        if (ownerXPixels < rect.left - kMovementCollisionPathWallMarginPixels
+            || ownerXPixels > rect.right + kMovementCollisionPathWallMarginPixels
+            || ownerYPixels < rect.top - kMovementCollisionPathWallMarginPixels
+            || ownerYPixels > rect.bottom + kMovementCollisionPathWallMarginPixels) {
+            continue;
+        }
+
+        const int dx = ownerXPixels < rect.left ? rect.left - ownerXPixels
+            : ownerXPixels > rect.right ? ownerXPixels - rect.right
+                                       : 0;
+        const int dy = ownerYPixels < rect.top ? rect.top - ownerYPixels
+            : ownerYPixels > rect.bottom ? ownerYPixels - rect.bottom
+                                        : 0;
+        const int distance = std::max(dx, dy);
+        if (distance < closestDistancePixels) {
+            closestDistancePixels = distance;
+            closestRect = &rect;
+        }
+    }
+
+    if (closestRect != nullptr) {
+        const Direct3D9OverlayRect& rect = *closestRect;
+        constexpr int kRopeCollisionPathTouchDistancePixels = 5;
+        constexpr int kTrackedRopeCollisionPathTouchDistancePixels = 8;
+        const bool trackedActiveOwner = activeCandidateMatches || turnOwnerMatches;
+        const bool ropeCollisionPathHit =
+            readOwnerKind
+            && ownerKind == 128
+            && readCollidedKind
+            && collidedKind == 0
+            && ((trackedActiveOwner && closestDistancePixels <= kTrackedRopeCollisionPathTouchDistancePixels)
+                || (currentTeamMatches && closestDistancePixels <= kRopeCollisionPathTouchDistancePixels));
+        if (ropeCollisionPathHit) {
+            markTouchedOverlayWallFromPhysics(
+                rect.wallIndex,
+                ownerAddress,
+                ownerXPixels,
+                ownerYPixels,
+                closestDistancePixels,
+                "rope-collision-path");
+        }
+    }
+}
+
+extern "C" void __cdecl recordWaMovementCollisionBranch(void* owner, void* collided) noexcept {
+    InterlockedIncrement(&g_movementCollisionBranchProbeHits);
+    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
+    const auto collidedAddress = reinterpret_cast<std::uintptr_t>(collided);
+
+    LONG ownerKind = 0;
+    LONG ownerXFixed = 0;
+    LONG ownerYFixed = 0;
+    LONG collidedKind = 0;
+    const bool readOwnerKind = owner != nullptr && tryReadLong(ownerAddress + kWaObjectKindOffset, ownerKind);
+    const bool readOwnerX = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryXOffset, ownerXFixed);
+    const bool readOwnerY = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryYOffset, ownerYFixed);
+    const bool readCollidedKind = collided != nullptr
+        && tryReadLong(collidedAddress + kWaObjectKindOffset, collidedKind);
+
+    const int ownerXPixels = readOwnerX ? fixedDeltaToPixels(ownerXFixed) : -9999;
+    const int ownerYPixels = readOwnerY ? fixedDeltaToPixels(ownerYFixed) : -9999;
+    const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
+    const bool activeCandidateMatches =
+        activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
+    const LONG turnOwnerAddress = g_wallTouchTurnOwnerAddress;
+    const bool turnOwnerMatches =
+        turnOwnerAddress != 0 && turnOwnerAddress == static_cast<LONG>(ownerAddress);
+    const bool currentTeamMatches = waObjectCurrentTeamMatches(owner);
+
+    int nearWallIndex = -1;
+    int nearWallDistance = 999999;
+    for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        const int dx = ownerXPixels < rect.left ? rect.left - ownerXPixels
+            : ownerXPixels > rect.right ? ownerXPixels - rect.right
+                                       : 0;
+        const int dy = ownerYPixels < rect.top ? rect.top - ownerYPixels
+            : ownerYPixels > rect.bottom ? ownerYPixels - rect.bottom
+                                        : 0;
+        const int distance = std::max(dx, dy);
+        if (distance < nearWallDistance) {
+            nearWallDistance = distance;
+            nearWallIndex = static_cast<int>(rect.wallIndex);
+        }
+    }
+
+    constexpr int kMovementCollisionBranchDryRunTouchThresholdPixels = 10;
+    const bool dryRunWouldTouch =
+        nearWallIndex >= 0 && nearWallDistance <= kMovementCollisionBranchDryRunTouchThresholdPixels;
+    const bool ropeCollisionOwner = readOwnerKind && (ownerKind == 123 || ownerKind == 128);
+    const bool physicsOwnerEligible = activeCandidateMatches
+        || turnOwnerMatches
+        || (ropeCollisionOwner && currentTeamMatches);
+    const bool terrainCollision = readCollidedKind && collidedKind == 0;
+    if (dryRunWouldTouch
+        && terrainCollision
+        && ropeCollisionOwner
+        && physicsOwnerEligible) {
+        markTouchedOverlayWallFromPhysics(
+            static_cast<std::size_t>(nearWallIndex),
+            ownerAddress,
+            ownerXPixels,
+            ownerYPixels,
+            nearWallDistance,
+            "rope-physics");
+    }
+}
+
+extern "C" void __cdecl recordWaCollisionQueryCommon(
+    void* caller,
+    void* context,
+    void* owner,
+    LONG xFixed,
+    LONG yFixed,
+    void* surface,
+    LONG flags) noexcept {
+    (void)context;
+    (void)surface;
+
+    InterlockedIncrement(&g_collisionQueryCommonProbeHits);
+    const auto callerAddress = reinterpret_cast<std::uintptr_t>(caller);
+    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
+    const int xPixels = fixedDeltaToPixels(xFixed);
+    const int yPixels = fixedDeltaToPixels(yFixed);
+    const bool mapCoordinate = candidateLooksLikeMapCoordinate(xFixed, yFixed);
+
+    LONG ownerKind = 0;
+    LONG ownerXFixed = 0;
+    LONG ownerYFixed = 0;
+    const bool readOwnerKind = owner != nullptr && tryReadLong(ownerAddress + kWaObjectKindOffset, ownerKind);
+    const bool readOwnerX = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryXOffset, ownerXFixed);
+    const bool readOwnerY = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryYOffset, ownerYFixed);
+    const bool looksLikeWorm = readOwnerKind && waObjectKindLooksLikeWorm(ownerKind);
+    const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
+    const bool activeCandidateMatches =
+        activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
+    const LONG turnOwnerAddress = g_wallTouchTurnOwnerAddress;
+    const bool turnOwnerMatches =
+        turnOwnerAddress != 0 && turnOwnerAddress == static_cast<LONG>(ownerAddress);
+    const bool ownerIsTrackedActiveWorm = activeOwnerAddress != 0 && (activeCandidateMatches || turnOwnerMatches);
+    const std::uintptr_t callerRva = g_waModuleBase != 0 && callerAddress >= g_waModuleBase
+        ? callerAddress - g_waModuleBase
+        : 0;
+
+    if (!looksLikeWorm
+        || !ownerIsTrackedActiveWorm
+        || !mapCoordinate
+        || g_direct3D9OverlayTestRects.empty()) {
+        return;
+    }
+
+    constexpr int kCollisionQueryCommonWallMarginPixels = 64;
+    const Direct3D9OverlayRect* closestRect = nullptr;
+    int closestDistancePixels = std::numeric_limits<int>::max();
+    for (const Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
+        if (xPixels < rect.left - kCollisionQueryCommonWallMarginPixels
+            || xPixels > rect.right + kCollisionQueryCommonWallMarginPixels
+            || yPixels < rect.top - kCollisionQueryCommonWallMarginPixels
+            || yPixels > rect.bottom + kCollisionQueryCommonWallMarginPixels) {
+            continue;
+        }
+
+        const int dx = xPixels < rect.left ? rect.left - xPixels : (xPixels > rect.right ? xPixels - rect.right : 0);
+        const int dy = yPixels < rect.top ? rect.top - yPixels : (yPixels > rect.bottom ? yPixels - rect.bottom : 0);
+        const int distancePixels = std::max(dx, dy);
+        if (distancePixels < closestDistancePixels) {
+            closestRect = &rect;
+            closestDistancePixels = distancePixels;
+        }
+    }
+
+    if (closestRect != nullptr) {
+        const Direct3D9OverlayRect& rect = *closestRect;
+        const bool collisionQueryFootContact =
+            flags == 2
+            && closestDistancePixels <= 5
+            && readOwnerX
+            && readOwnerY
+            && (callerRva == 0x00100284
+                || callerRva == 0x0010016B
+                || callerRva == 0x00100203
+                || callerRva == 0x001001A3);
+        const bool collisionQueryFootBounce =
+            flags == 4328646
+            && closestDistancePixels <= 6
+            && readOwnerX
+            && readOwnerY
+            && (callerRva == 0x000FB9C0
+                || callerRva == 0x000FD1BB);
+        if (collisionQueryFootContact) {
+            markTouchedOverlayWallFromPhysics(
+                rect.wallIndex,
+                ownerAddress,
+                fixedDeltaToPixels(ownerXFixed),
+                fixedDeltaToPixels(ownerYFixed),
+                closestDistancePixels,
+                "collision-query-foot");
+        } else if (collisionQueryFootBounce) {
+            markTouchedOverlayWallFromPhysics(
+                rect.wallIndex,
+                ownerAddress,
+                fixedDeltaToPixels(ownerXFixed),
+                fixedDeltaToPixels(ownerYFixed),
+                closestDistancePixels,
+                "collision-query-foot-bounce");
+        }
+        return;
+    }
+}
+
 extern "C" void __cdecl recordWaCameraRenderOwner(void* owner) noexcept {
     if (owner == nullptr) {
         return;
@@ -3540,74 +4203,33 @@ void logTrackingTargetOverlay(
     g_runtimeProbeLogger->info(message.str());
 }
 
-extern "C" void __cdecl recordWaGameTimerTransition() noexcept {
-    const LONG hits = InterlockedIncrement(&g_gameTimerTransitionProbeHits);
-    const LONG stateAddressLong = g_gameTimerTransitionStateAddress;
-    LONG currentState = -1;
-    bool hasState = false;
-    if (stateAddressLong != 0) {
-        const auto stateAddress = static_cast<std::uintptr_t>(
-            static_cast<std::uint32_t>(stateAddressLong));
-        hasState = tryReadLong(stateAddress, currentState);
+int __fastcall hookedWaTurnGameHandleMessage(
+    void* turnGame,
+    void* edx,
+    void* sender,
+    std::uint32_t messageType,
+    std::size_t dataSize,
+    void* data) {
+    InterlockedIncrement(&g_turnGameHandleMessageProbeHits);
+
+    if (waTaskMessageLooksTurnRelated(messageType)) {
+        logTurnGameMessageProbe("before", turnGame, sender, messageType, dataSize, data, 0);
     }
 
-    LONG previousState = g_gameTimerTransitionLastState;
-    bool stateChanged = false;
-    if (hasState) {
-        previousState = InterlockedExchange(&g_gameTimerTransitionLastState, currentState);
-        stateChanged = previousState != -1 && previousState != currentState;
+    int result = 0;
+    if (g_originalWaTurnGameHandleMessage != nullptr) {
+        result = g_originalWaTurnGameHandleMessage(turnGame, edx, sender, messageType, dataSize, data);
     }
 
-    if (g_runtimeProbeLogger != nullptr
-        && g_gameTimerTransitionLogCount < 24
-        && (hits <= 4 || stateChanged)) {
-        InterlockedIncrement(&g_gameTimerTransitionLogCount);
-
-        std::ostringstream message;
-        message << "runtime probe: W:A game timer transition hook hit state ";
-        if (hasState) {
-            message << previousState << " -> " << currentState;
-        } else {
-            message << "unavailable";
-        }
-        message << ", total hits " << hits;
-        g_runtimeProbeLogger->info(message.str());
+    if (waTaskMessageLooksTurnRelated(messageType)) {
+        logTurnGameMessageProbe("after", turnGame, sender, messageType, dataSize, data, result);
     }
 
-    if (!stateChanged
-        || g_direct3D9OverlayTestRects.empty()
-        || g_direct3D9OverlayGameplayActive == 0) {
-        return;
+    if (messageType == 52) {
+        resetTouchedOverlayWallsForTurnGameFinishTurn(turnGame, data, dataSize);
     }
 
-    const DWORD now = GetTickCount();
-    const DWORD lastResetTick = static_cast<DWORD>(g_wallTouchLastResetTick);
-    if (lastResetTick != 0
-        && now - lastResetTick < kGameTimerTransitionResetDebounceMilliseconds) {
-        return;
-    }
-
-    const std::size_t resetCount = resetTouchedOverlayWallsForNewTurn();
-    if (resetCount == 0) {
-        return;
-    }
-
-    clearActiveWormCandidateForTurnChange();
-    InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(now));
-
-    if (g_runtimeProbeLogger != nullptr && g_wallTouchResetLogCount < 32) {
-        InterlockedIncrement(&g_wallTouchResetLogCount);
-
-        std::ostringstream message;
-        message << "runtime probe: wall touch state reset for game timer transition state "
-                << previousState
-                << " -> "
-                << currentState
-                << ", reset "
-                << resetCount
-                << " touched wall(s)";
-        g_runtimeProbeLogger->info(message.str());
-    }
+    return result;
 }
 
 void* buildWaCameraTrackingProbeStub(std::uint8_t* target, std::size_t stolenLength, std::string& error) {
@@ -3852,58 +4474,6 @@ void* buildWaCameraTargetAggregateChainProbeStub(std::uintptr_t existingDetour, 
     return stub;
 }
 
-void* buildWaGameTimerTransitionProbeStub(std::uint8_t* target, std::size_t stolenLength, std::string& error) {
-    error.clear();
-    if (target == nullptr || stolenLength < kX86JumpBytes) {
-        error = "invalid game timer transition probe target";
-        return nullptr;
-    }
-
-    constexpr std::size_t prologueBytes = 1 + 1 + kX86JumpBytes + 1 + 1;
-    constexpr std::size_t jumpBackBytes = kX86JumpBytes;
-    const std::size_t stubSize = prologueBytes + stolenLength + jumpBackBytes;
-
-    auto* stub = static_cast<std::uint8_t*>(
-        VirtualAlloc(nullptr, stubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (stub == nullptr) {
-        error = "failed to allocate game timer transition probe stub";
-        return nullptr;
-    }
-
-    std::size_t offset = 0;
-    stub[offset++] = 0x60; // pushad
-    stub[offset++] = 0x9C; // pushfd
-
-    std::uint8_t* callRecord = stub + offset;
-    if (!relativeJumpFits(
-            reinterpret_cast<std::uintptr_t>(callRecord),
-            reinterpret_cast<std::uintptr_t>(&recordWaGameTimerTransition))) {
-        VirtualFree(stub, 0, MEM_RELEASE);
-        error = "game timer transition probe callback is too far from stub";
-        return nullptr;
-    }
-    writeRelativeCall(callRecord, reinterpret_cast<std::uintptr_t>(&recordWaGameTimerTransition));
-    offset += kX86JumpBytes;
-
-    stub[offset++] = 0x9D; // popfd
-    stub[offset++] = 0x61; // popad
-
-    std::memcpy(stub + offset, target, stolenLength);
-    offset += stolenLength;
-
-    std::uint8_t* jumpBack = stub + offset;
-    const std::uintptr_t jumpBackDestination = reinterpret_cast<std::uintptr_t>(target + stolenLength);
-    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpBack), jumpBackDestination)) {
-        VirtualFree(stub, 0, MEM_RELEASE);
-        error = "game timer transition probe jump-back is too far from stub";
-        return nullptr;
-    }
-    writeRelativeJump(jumpBack, jumpBackDestination);
-
-    FlushInstructionCache(GetCurrentProcess(), stub, stubSize);
-    return stub;
-}
-
 void* buildWaWormMotionCandidateProbeStub(std::uint8_t* target, std::size_t stolenLength, std::string& error) {
     error.clear();
     if (target == nullptr || stolenLength < kX86JumpBytes) {
@@ -3952,6 +4522,526 @@ void* buildWaWormMotionCandidateProbeStub(std::uint8_t* target, std::size_t stol
     if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpBack), jumpBackDestination)) {
         VirtualFree(stub, 0, MEM_RELEASE);
         error = "worm motion candidate probe jump-back is too far from stub";
+        return nullptr;
+    }
+    writeRelativeJump(jumpBack, jumpBackDestination);
+
+    FlushInstructionCache(GetCurrentProcess(), stub, stubSize);
+    return stub;
+}
+
+void* buildWaJumpTerrainCollisionResultProbeStub(std::uint8_t* target, std::string& error) {
+    error.clear();
+    if (target == nullptr) {
+        error = "invalid jump terrain collision result probe target";
+        return nullptr;
+    }
+
+    constexpr std::size_t prologueBytes =
+        1 + 1
+        + 4 + 1
+        + 4 + 3 + 5 + 1
+        + 4 + 3 + 1
+        + 4 + 1
+        + kX86JumpBytes
+        + 3 + 1 + 1;
+    constexpr std::size_t replayBytes = 2 + 6 + kX86JumpBytes;
+    const std::size_t stubSize = prologueBytes + replayBytes;
+
+    auto* stub = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, stubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        error = "failed to allocate jump terrain collision result probe stub";
+        return nullptr;
+    }
+
+    std::size_t offset = 0;
+    stub[offset++] = 0x60; // pushad
+    stub[offset++] = 0x9C; // pushfd
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x20; // mov eax, [esp+0x20] - original eax / collision result
+    stub[offset++] = 0x50; // push eax
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x14; // mov eax, [esp+0x14] - original esp after result push
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x40;
+    stub[offset++] = 0x1C; // mov eax, [eax+0x1c] - original y input
+    stub[offset++] = 0x05;
+    stub[offset++] = 0x00;
+    stub[offset++] = 0x00;
+    stub[offset++] = 0x01;
+    stub[offset++] = 0x00; // add eax, 0x10000
+    stub[offset++] = 0x50; // push eax (yFixed)
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x18; // mov eax, [esp+0x18] - original esp after result/y pushes
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x40;
+    stub[offset++] = 0x18; // mov eax, [eax+0x18] - original x input
+    stub[offset++] = 0x50; // push eax (xFixed)
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x14; // mov eax, [esp+0x14] - original esi after result/y/x pushes
+    stub[offset++] = 0x50; // push eax (owner)
+
+    std::uint8_t* callRecord = stub + offset;
+    if (!relativeJumpFits(
+            reinterpret_cast<std::uintptr_t>(callRecord),
+            reinterpret_cast<std::uintptr_t>(&recordWaJumpTerrainCollisionResult))) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "jump terrain collision result probe callback is too far from stub";
+        return nullptr;
+    }
+    writeRelativeCall(callRecord, reinterpret_cast<std::uintptr_t>(&recordWaJumpTerrainCollisionResult));
+    offset += kX86JumpBytes;
+
+    stub[offset++] = 0x83;
+    stub[offset++] = 0xC4;
+    stub[offset++] = 0x10; // add esp, 16
+    stub[offset++] = 0x9D; // popfd
+    stub[offset++] = 0x61; // popad
+
+    stub[offset++] = 0x85;
+    stub[offset++] = 0xC0; // test eax, eax
+
+    stub[offset++] = 0x0F;
+    stub[offset++] = 0x85; // jne original branch
+    const std::uintptr_t originalBranchDestination = reinterpret_cast<std::uintptr_t>(target + 0x670);
+    const auto conditionalDistance = static_cast<std::int32_t>(
+        originalBranchDestination - reinterpret_cast<std::uintptr_t>(stub + offset + 4));
+    std::memcpy(stub + offset, &conditionalDistance, sizeof(conditionalDistance));
+    offset += sizeof(conditionalDistance);
+
+    std::uint8_t* jumpBack = stub + offset;
+    const std::uintptr_t jumpBackDestination =
+        reinterpret_cast<std::uintptr_t>(target + kWaJumpTerrainCollisionResultPatchLength);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpBack), jumpBackDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "jump terrain collision result probe jump-back is too far from stub";
+        return nullptr;
+    }
+    writeRelativeJump(jumpBack, jumpBackDestination);
+    offset += kX86JumpBytes;
+
+    FlushInstructionCache(GetCurrentProcess(), stub, stubSize);
+    return stub;
+}
+
+void* buildWaMovementResolutionResultProbeStub(
+    std::uint8_t* target,
+    std::uintptr_t siteRva,
+    std::uint8_t zeroBranchOffset,
+    const std::array<std::uint8_t, 4>& replayInstruction,
+    std::string& error) {
+    error.clear();
+    if (target == nullptr) {
+        error = "invalid movement resolution result probe target";
+        return nullptr;
+    }
+
+    constexpr std::size_t prologueBytes =
+        1 + 1
+        + 5
+        + 4 + 1
+        + 4 + 1
+        + kX86JumpBytes
+        + 3 + 1 + 1;
+    constexpr std::size_t replayBytes = 2 + 6 + 4 + kX86JumpBytes;
+    const std::size_t stubSize = prologueBytes + replayBytes;
+
+    auto* stub = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, stubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        error = "failed to allocate movement resolution result probe stub";
+        return nullptr;
+    }
+
+    std::size_t offset = 0;
+    stub[offset++] = 0x60; // pushad
+    stub[offset++] = 0x9C; // pushfd
+
+    stub[offset++] = 0x68; // push site RVA
+    const auto siteRva32 = static_cast<std::uint32_t>(siteRva);
+    std::memcpy(stub + offset, &siteRva32, sizeof(siteRva32));
+    offset += sizeof(siteRva32);
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x24; // mov eax, [esp+0x24] - original eax after site push
+    stub[offset++] = 0x50; // push eax (result)
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x1C; // mov eax, [esp+0x1c] - original ebx after site/result pushes
+    stub[offset++] = 0x50; // push eax (owner)
+
+    std::uint8_t* callRecord = stub + offset;
+    if (!relativeJumpFits(
+            reinterpret_cast<std::uintptr_t>(callRecord),
+            reinterpret_cast<std::uintptr_t>(&recordWaMovementResolutionResult))) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement resolution result probe callback is too far from stub";
+        return nullptr;
+    }
+    writeRelativeCall(callRecord, reinterpret_cast<std::uintptr_t>(&recordWaMovementResolutionResult));
+    offset += kX86JumpBytes;
+
+    stub[offset++] = 0x83;
+    stub[offset++] = 0xC4;
+    stub[offset++] = 0x0C; // add esp, 12
+    stub[offset++] = 0x9D; // popfd
+    stub[offset++] = 0x61; // popad
+
+    stub[offset++] = 0x85;
+    stub[offset++] = 0xC0; // test eax, eax
+
+    std::uint8_t* jumpIfZero = stub + offset;
+    const std::uintptr_t zeroDestination = reinterpret_cast<std::uintptr_t>(target + zeroBranchOffset);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpIfZero), zeroDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement resolution result conditional jump is too far from stub";
+        return nullptr;
+    }
+    jumpIfZero[0] = 0x0F;
+    jumpIfZero[1] = 0x84;
+    const auto conditionalDistance = static_cast<std::int32_t>(
+        zeroDestination - reinterpret_cast<std::uintptr_t>(jumpIfZero + 6));
+    std::memcpy(jumpIfZero + 2, &conditionalDistance, sizeof(conditionalDistance));
+    offset += 6;
+
+    std::memcpy(stub + offset, replayInstruction.data(), replayInstruction.size());
+    offset += replayInstruction.size();
+
+    std::uint8_t* jumpBack = stub + offset;
+    const std::uintptr_t jumpBackDestination =
+        reinterpret_cast<std::uintptr_t>(target + kWaMovementResolutionResultPatchLength);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpBack), jumpBackDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement resolution result probe jump-back is too far from stub";
+        return nullptr;
+    }
+    writeRelativeJump(jumpBack, jumpBackDestination);
+    offset += kX86JumpBytes;
+
+    FlushInstructionCache(GetCurrentProcess(), stub, stubSize);
+    return stub;
+}
+
+void* buildWaMovementCollisionResultProbeStub(std::uint8_t* target, std::string& error) {
+    error.clear();
+    if (target == nullptr) {
+        error = "invalid movement collision result probe target";
+        return nullptr;
+    }
+
+    constexpr std::size_t prologueBytes = 1 + 1 + (4 + 1) * 4 + kX86JumpBytes + 3 + 1 + 1;
+    constexpr std::size_t replayBytes = 2 + 6 + 2 + kX86JumpBytes + kX86JumpBytes;
+    const std::size_t stubSize = prologueBytes + replayBytes;
+
+    auto* stub = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, stubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        error = "failed to allocate movement collision result probe stub";
+        return nullptr;
+    }
+
+    std::size_t offset = 0;
+    stub[offset++] = 0x60; // pushad
+    stub[offset++] = 0x9C; // pushfd
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x20; // mov eax, [esp+0x20] - original eax / collision result
+    stub[offset++] = 0x50; // push eax
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x08; // mov eax, [esp+0x08] - original edi after collision push
+    stub[offset++] = 0x50; // push eax (yFixed)
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x1C; // mov eax, [esp+0x1C] - original ebx after two pushes
+    stub[offset++] = 0x50; // push eax (xFixed)
+
+    stub[offset++] = 0x8B;
+    stub[offset++] = 0x44;
+    stub[offset++] = 0x24;
+    stub[offset++] = 0x14; // mov eax, [esp+0x14] - original esi after three pushes
+    stub[offset++] = 0x50; // push eax (owner)
+
+    std::uint8_t* callRecord = stub + offset;
+    if (!relativeJumpFits(
+            reinterpret_cast<std::uintptr_t>(callRecord),
+            reinterpret_cast<std::uintptr_t>(&recordWaMovementCollisionResult))) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision result probe callback is too far from stub";
+        return nullptr;
+    }
+    writeRelativeCall(callRecord, reinterpret_cast<std::uintptr_t>(&recordWaMovementCollisionResult));
+    offset += kX86JumpBytes;
+
+    stub[offset++] = 0x83;
+    stub[offset++] = 0xC4;
+    stub[offset++] = 0x10; // add esp, 16
+    stub[offset++] = 0x9D; // popfd
+    stub[offset++] = 0x61; // popad
+
+    stub[offset++] = 0x85;
+    stub[offset++] = 0xC0; // test eax, eax
+
+    std::uint8_t* jumpIfNoCollision = stub + offset;
+    stub[offset++] = 0x0F;
+    stub[offset++] = 0x84;
+    offset += 4; // je success branch, patched below
+
+    stub[offset++] = 0x33;
+    stub[offset++] = 0xC0; // xor eax, eax
+
+    std::uint8_t* blockedJump = stub + offset;
+    const std::uintptr_t blockedDestination =
+        reinterpret_cast<std::uintptr_t>(target + kWaMovementCollisionResultPatchLength);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(blockedJump), blockedDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision result blocked jump-back is too far from stub";
+        return nullptr;
+    }
+    writeRelativeJump(blockedJump, blockedDestination);
+    offset += kX86JumpBytes;
+
+    std::uint8_t* successJumpTarget = stub + offset;
+    std::uint8_t* successJump = stub + offset;
+    const std::uintptr_t successDestination = reinterpret_cast<std::uintptr_t>(target + 0x0A);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(successJump), successDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision result success jump-back is too far from stub";
+        return nullptr;
+    }
+    writeRelativeJump(successJump, successDestination);
+    offset += kX86JumpBytes;
+
+    const std::intptr_t conditionalDistance =
+        reinterpret_cast<std::intptr_t>(successJumpTarget)
+        - reinterpret_cast<std::intptr_t>(jumpIfNoCollision + 6);
+    *reinterpret_cast<std::int32_t*>(jumpIfNoCollision + 2) = static_cast<std::int32_t>(conditionalDistance);
+
+    FlushInstructionCache(GetCurrentProcess(), stub, stubSize);
+    return stub;
+}
+
+void* buildWaMovementCollisionPathProbeStub(std::uint8_t* target, std::string& error) {
+    error.clear();
+    if (target == nullptr) {
+        error = "invalid movement collision path probe target";
+        return nullptr;
+    }
+
+    constexpr std::size_t prologueBytes = 1 + 1 + 1 + 1 + kX86JumpBytes + 3 + 1 + 1;
+    constexpr std::size_t replayBytes = 3 + 6 + kX86JumpBytes;
+    const std::size_t stubSize = prologueBytes + replayBytes;
+
+    auto* stub = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, stubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        error = "failed to allocate movement collision path probe stub";
+        return nullptr;
+    }
+
+    std::size_t offset = 0;
+    stub[offset++] = 0x60; // pushad
+    stub[offset++] = 0x9C; // pushfd
+    stub[offset++] = 0x57; // push edi - collided object
+    stub[offset++] = 0x56; // push esi - moving owner
+
+    std::uint8_t* callRecord = stub + offset;
+    if (!relativeJumpFits(
+            reinterpret_cast<std::uintptr_t>(callRecord),
+            reinterpret_cast<std::uintptr_t>(&recordWaMovementCollisionPath))) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision path probe callback is too far from stub";
+        return nullptr;
+    }
+    writeRelativeCall(callRecord, reinterpret_cast<std::uintptr_t>(&recordWaMovementCollisionPath));
+    offset += kX86JumpBytes;
+
+    stub[offset++] = 0x83;
+    stub[offset++] = 0xC4;
+    stub[offset++] = 0x08; // add esp, 8
+    stub[offset++] = 0x9D; // popfd
+    stub[offset++] = 0x61; // popad
+
+    stub[offset++] = 0x3B;
+    stub[offset++] = 0x7D;
+    stub[offset++] = 0x08; // cmp edi, [ebp+0x8]
+
+    std::uint8_t* jumpIfSameObject = stub + offset;
+    const std::uintptr_t sameObjectDestination = reinterpret_cast<std::uintptr_t>(target + 0x4B);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpIfSameObject), sameObjectDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision path conditional jump is too far from stub";
+        return nullptr;
+    }
+    jumpIfSameObject[0] = 0x0F;
+    jumpIfSameObject[1] = 0x84;
+    const std::intptr_t conditionalDistance = static_cast<std::intptr_t>(sameObjectDestination)
+        - reinterpret_cast<std::intptr_t>(jumpIfSameObject + 6);
+    *reinterpret_cast<std::int32_t*>(jumpIfSameObject + 2) = static_cast<std::int32_t>(conditionalDistance);
+    offset += 6;
+
+    std::uint8_t* jumpBack = stub + offset;
+    const std::uintptr_t jumpBackDestination =
+        reinterpret_cast<std::uintptr_t>(target + kWaMovementCollisionPathPatchLength);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpBack), jumpBackDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision path probe jump-back is too far from stub";
+        return nullptr;
+    }
+    writeRelativeJump(jumpBack, jumpBackDestination);
+
+    FlushInstructionCache(GetCurrentProcess(), stub, stubSize);
+    return stub;
+}
+
+void* buildWaMovementCollisionBranchProbeStub(std::uint8_t* target, std::string& error) {
+    error.clear();
+    if (target == nullptr) {
+        error = "invalid movement collision branch probe target";
+        return nullptr;
+    }
+
+    constexpr std::size_t prologueBytes = 1 + 1 + 1 + 1 + kX86JumpBytes + 3 + 1 + 1;
+    constexpr std::size_t replayBytes = kWaMovementCollisionBranchPatchLength + kX86JumpBytes;
+    const std::size_t stubSize = prologueBytes + replayBytes;
+
+    auto* stub = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, stubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        error = "failed to allocate movement collision branch probe stub";
+        return nullptr;
+    }
+
+    std::size_t offset = 0;
+    stub[offset++] = 0x60; // pushad
+    stub[offset++] = 0x9C; // pushfd
+    stub[offset++] = 0x51; // push ecx - collided object
+    stub[offset++] = 0x56; // push esi - moving owner
+
+    std::uint8_t* callRecord = stub + offset;
+    if (!relativeJumpFits(
+            reinterpret_cast<std::uintptr_t>(callRecord),
+            reinterpret_cast<std::uintptr_t>(&recordWaMovementCollisionBranch))) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision branch probe callback is too far from stub";
+        return nullptr;
+    }
+    writeRelativeCall(callRecord, reinterpret_cast<std::uintptr_t>(&recordWaMovementCollisionBranch));
+    offset += kX86JumpBytes;
+
+    stub[offset++] = 0x83;
+    stub[offset++] = 0xC4;
+    stub[offset++] = 0x08; // add esp, 8
+    stub[offset++] = 0x9D; // popfd
+    stub[offset++] = 0x61; // popad
+
+    std::memcpy(stub + offset, target, kWaMovementCollisionBranchPatchLength);
+    offset += kWaMovementCollisionBranchPatchLength;
+
+    std::uint8_t* jumpBack = stub + offset;
+    const std::uintptr_t jumpBackDestination =
+        reinterpret_cast<std::uintptr_t>(target + kWaMovementCollisionBranchPatchLength);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpBack), jumpBackDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "movement collision branch probe jump-back is too far from stub";
+        return nullptr;
+    }
+    writeRelativeJump(jumpBack, jumpBackDestination);
+
+    FlushInstructionCache(GetCurrentProcess(), stub, stubSize);
+    return stub;
+}
+
+void* buildWaCollisionQueryCommonProbeStub(std::uint8_t* target, std::string& error) {
+    error.clear();
+    if (target == nullptr) {
+        error = "invalid collision query common probe target";
+        return nullptr;
+    }
+
+    constexpr std::size_t pushedArgumentBytes = (4 + 1) * 7;
+    constexpr std::size_t prologueBytes = 1 + 1 + pushedArgumentBytes + kX86JumpBytes + 3 + 1 + 1;
+    constexpr std::size_t replayBytes = kWaCollisionQueryCommonPatchLength + kX86JumpBytes;
+    const std::size_t stubSize = prologueBytes + replayBytes;
+
+    auto* stub = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, stubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        error = "failed to allocate collision query common probe stub";
+        return nullptr;
+    }
+
+    std::size_t offset = 0;
+    stub[offset++] = 0x60; // pushad
+    stub[offset++] = 0x9C; // pushfd
+
+    const std::uint8_t argumentOffsets[] = {
+        0x3C, // flags, original [esp+0x18]
+        0x3C, // surface, original [esp+0x14] after one push
+        0x3C, // y, original [esp+0x10] after two pushes
+        0x3C, // x, original [esp+0x0c] after three pushes
+        0x3C, // owner, original [esp+0x08] after four pushes
+        0x3C, // context, original [esp+0x04] after five pushes
+        0x3C, // caller return, original [esp] after six pushes
+    };
+
+    for (std::uint8_t stackOffset : argumentOffsets) {
+        stub[offset++] = 0x8B;
+        stub[offset++] = 0x44;
+        stub[offset++] = 0x24;
+        stub[offset++] = stackOffset; // mov eax, [esp+offset]
+        stub[offset++] = 0x50; // push eax
+    }
+
+    std::uint8_t* callRecord = stub + offset;
+    if (!relativeJumpFits(
+            reinterpret_cast<std::uintptr_t>(callRecord),
+            reinterpret_cast<std::uintptr_t>(&recordWaCollisionQueryCommon))) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "collision query common probe callback is too far from stub";
+        return nullptr;
+    }
+    writeRelativeCall(callRecord, reinterpret_cast<std::uintptr_t>(&recordWaCollisionQueryCommon));
+    offset += kX86JumpBytes;
+
+    stub[offset++] = 0x83;
+    stub[offset++] = 0xC4;
+    stub[offset++] = 0x1C; // add esp, 28
+    stub[offset++] = 0x9D; // popfd
+    stub[offset++] = 0x61; // popad
+
+    std::memcpy(stub + offset, target, kWaCollisionQueryCommonPatchLength);
+    offset += kWaCollisionQueryCommonPatchLength;
+
+    std::uint8_t* jumpBack = stub + offset;
+    const std::uintptr_t jumpBackDestination =
+        reinterpret_cast<std::uintptr_t>(target + kWaCollisionQueryCommonPatchLength);
+    if (!relativeJumpFits(reinterpret_cast<std::uintptr_t>(jumpBack), jumpBackDestination)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        error = "collision query common probe jump-back is too far from stub";
         return nullptr;
     }
     writeRelativeJump(jumpBack, jumpBackDestination);
@@ -4174,60 +5264,97 @@ bool installWaCameraTargetAggregateProbe(
     return true;
 }
 
-[[maybe_unused]] bool installWaGameTimerTransitionProbe(
+bool installWaTurnGameHandleMessageProbe(
     Logger& logger,
     const ProcessModuleView& module,
     X86DetourHook& hook,
     std::string& error) {
     error.clear();
 
-    auto* target = reinterpret_cast<std::uint8_t*>(module.base + kWa381GameTimerTransitionRva);
-    if (target[0] != 0xA1
-        || target[5] != 0x83
-        || target[6] != 0xEC
-        || target[7] != 0x1C) {
+    BytePattern pattern;
+    std::string patternError;
+    if (!parseBytePattern(
+            "55 8B EC 83 E4 F8 81 EC ?? ?? ?? ?? 53 8B 5D 0C 56 8D 43 FE "
+            "83 F8 7B 57 8B F1 0F 87 ?? ?? ?? ?? 0F B6 80 ?? ?? ?? ?? "
+            "FF 24 85 ?? ?? ?? ?? 8B 86 ?? ?? ?? ??",
+            pattern,
+            patternError)) {
+        error = "failed to parse CTaskTurnGame::HandleMessage pattern: " + patternError;
+        return false;
+    }
+
+    const std::vector<std::uintptr_t> matches = findBytePattern(module, pattern, 2);
+    std::uint8_t* target = nullptr;
+    if (matches.empty()) {
+        target = reinterpret_cast<std::uint8_t*>(module.base + kWa381TurnGameHandleMessageRva);
         std::ostringstream message;
-        message << "W:A game timer transition prologue did not match the expected 3.8.1 bytes at "
+        message << "runtime probe: CTaskTurnGame::HandleMessage pattern did not match; "
+                << "falling back to W:A 3.8.1 RVA "
+                << formatAddress(kWa381TurnGameHandleMessageRva)
+                << ", bytes "
+                << formatCodeBytes(target, 16);
+        logger.warn(message.str());
+    } else if (matches.size() > 1) {
+        std::ostringstream message;
+        message << "CTaskTurnGame::HandleMessage pattern matched "
+                << matches.size()
+                << " locations; using first match at "
+                << formatAddress(matches.front());
+        logger.warn(message.str());
+        target = reinterpret_cast<std::uint8_t*>(matches.front());
+    } else {
+        target = reinterpret_cast<std::uint8_t*>(matches.front());
+    }
+
+    bool chainedExistingDetour = false;
+    std::uintptr_t existingDetour = 0;
+    if (target[0] == 0xE9) {
+        std::int32_t relativeDetour = 0;
+        std::memcpy(&relativeDetour, target + 1, sizeof(relativeDetour));
+        existingDetour = reinterpret_cast<std::uintptr_t>(target + kX86JumpBytes) + relativeDetour;
+        chainedExistingDetour = true;
+    } else if (target[0] != 0x55
+        || target[1] != 0x8B
+        || target[2] != 0xEC
+        || target[3] != 0x83
+        || target[4] != 0xE4
+        || target[5] != 0xF8) {
+        std::ostringstream message;
+        message << "CTaskTurnGame::HandleMessage prologue did not match expected bytes at "
                 << formatAddress(reinterpret_cast<std::uintptr_t>(target))
                 << " (RVA "
-                << formatAddress(kWa381GameTimerTransitionRva)
+                << formatRva(reinterpret_cast<std::uintptr_t>(target), module.base)
                 << "), actual "
                 << formatCodeBytes(target, 8);
         error = message.str();
         return false;
     }
 
-    std::uintptr_t timerStateAddress = 0;
-    std::memcpy(&timerStateAddress, target + 1, sizeof(std::uint32_t));
-
-    std::string stubError;
-    void* stub = buildWaGameTimerTransitionProbeStub(target, kWaGameTimerTransitionPatchLength, stubError);
-    if (stub == nullptr) {
-        error = stubError;
+    const std::size_t patchLength = chainedExistingDetour
+        ? kX86JumpBytes
+        : kWaTurnGameHandleMessagePatchLength;
+    if (!hook.install(target, reinterpret_cast<void*>(&hookedWaTurnGameHandleMessage),
+            patchLength, error)) {
         return false;
     }
 
-    if (!hook.install(target, stub, kWaGameTimerTransitionPatchLength, error)) {
-        VirtualFree(stub, 0, MEM_RELEASE);
-        return false;
-    }
-
-    g_gameTimerTransitionProbeStub = stub;
-    InterlockedExchange(&g_gameTimerTransitionProbeHits, 0);
-    InterlockedExchange(&g_gameTimerTransitionLogCount, 0);
-    InterlockedExchange(&g_gameTimerTransitionStateAddress, static_cast<LONG>(timerStateAddress));
-    InterlockedExchange(&g_gameTimerTransitionLastState, -1);
+    g_originalWaTurnGameHandleMessage = chainedExistingDetour
+        ? reinterpret_cast<WaTurnGameHandleMessageFunction>(existingDetour)
+        : reinterpret_cast<WaTurnGameHandleMessageFunction>(hook.trampoline());
+    InterlockedExchange(&g_turnGameHandleMessageProbeHits, 0);
+    InterlockedExchange(&g_turnGameHandleMessageLogCount, 0);
 
     std::ostringstream message;
-    message << "runtime probe: W:A game timer transition hook installed at "
+    message << "runtime probe: CTaskTurnGame::HandleMessage hook installed at "
             << formatAddress(reinterpret_cast<std::uintptr_t>(target))
-            << " using probe stub "
-            << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
             << " (RVA "
-            << formatAddress(kWa381GameTimerTransitionRva)
-            << ", state "
-            << formatAddress(timerStateAddress)
-            << ")";
+            << formatRva(reinterpret_cast<std::uintptr_t>(target), module.base)
+            << "), trampoline "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalWaTurnGameHandleMessage));
+    if (chainedExistingDetour) {
+        message << ", chained existing detour "
+                << formatAddress(existingDetour);
+    }
     logger.info(message.str());
     return true;
 }
@@ -4282,6 +5409,331 @@ bool installWaWormMotionCandidateProbe(
             << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
             << " (RVA "
             << formatAddress(kWa381WormMotionCandidateRva)
+            << ")";
+    logger.info(message.str());
+    return true;
+}
+
+bool installWaJumpTerrainCollisionResultProbe(
+    Logger& logger,
+    const ProcessModuleView& module,
+    X86DetourHook& hook,
+    std::string& error) {
+    error.clear();
+
+    auto* target = reinterpret_cast<std::uint8_t*>(module.base + kWa381JumpTerrainCollisionResultRva);
+    if (target[0] != 0x85
+        || target[1] != 0xC0
+        || target[2] != 0x0F
+        || target[3] != 0x85) {
+        std::ostringstream message;
+        message << "W:A jump terrain collision result prologue did not match the expected 3.8.1 bytes at "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+                << " (RVA "
+                << formatAddress(kWa381JumpTerrainCollisionResultRva)
+                << "), actual "
+                << formatCodeBytes(target, 8);
+        error = message.str();
+        return false;
+    }
+
+    std::string stubError;
+    void* stub = buildWaJumpTerrainCollisionResultProbeStub(target, stubError);
+    if (stub == nullptr) {
+        error = stubError;
+        return false;
+    }
+
+    if (!hook.install(target, stub, kWaJumpTerrainCollisionResultPatchLength, error)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_jumpTerrainCollisionResultProbeStub = stub;
+    InterlockedExchange(&g_jumpTerrainCollisionResultProbeHits, 0);
+    InterlockedExchange(&g_jumpTerrainCollisionResultLogCount, 0);
+    InterlockedExchange(&g_jumpTerrainCollisionResultNearWallLogCount, 0);
+
+    std::ostringstream message;
+    message << "runtime probe: W:A jump terrain collision result hook installed at "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+            << " using probe stub "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
+            << " (RVA "
+            << formatAddress(kWa381JumpTerrainCollisionResultRva)
+            << ")";
+    logger.info(message.str());
+    return true;
+}
+
+bool installWaMovementResolutionResultProbe(
+    Logger& logger,
+    const ProcessModuleView& module,
+    X86DetourHook& hook,
+    std::uintptr_t siteRva,
+    std::uint8_t zeroBranchOffset,
+    const std::array<std::uint8_t, 8>& expectedBytes,
+    const std::array<std::uint8_t, 4>& replayInstruction,
+    void*& stubStorage,
+    const char* label,
+    std::string& error) {
+    error.clear();
+
+    auto* target = reinterpret_cast<std::uint8_t*>(module.base + siteRva);
+    if (!std::equal(expectedBytes.begin(), expectedBytes.end(), target)) {
+        std::ostringstream message;
+        message << "W:A "
+                << label
+                << " prologue did not match the expected 3.8.1 bytes at "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+                << " (RVA "
+                << formatAddress(siteRva)
+                << "), actual "
+                << formatCodeBytes(target, 10);
+        error = message.str();
+        return false;
+    }
+
+    std::string stubError;
+    void* stub = buildWaMovementResolutionResultProbeStub(
+        target,
+        siteRva,
+        zeroBranchOffset,
+        replayInstruction,
+        stubError);
+    if (stub == nullptr) {
+        error = stubError;
+        return false;
+    }
+
+    if (!hook.install(target, stub, kWaMovementResolutionResultPatchLength, error)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    stubStorage = stub;
+    InterlockedExchange(&g_movementResolutionResultProbeHits, 0);
+    InterlockedExchange(&g_movementResolutionResultLogCount, 0);
+    InterlockedExchange(&g_movementResolutionResultNearWallLogCount, 0);
+
+    std::ostringstream message;
+    message << "runtime probe: W:A "
+            << label
+            << " hook installed at "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+            << " using probe stub "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
+            << " (RVA "
+            << formatAddress(siteRva)
+            << ")";
+    logger.info(message.str());
+    return true;
+}
+
+bool installWaMovementCollisionResultProbe(
+    Logger& logger,
+    const ProcessModuleView& module,
+    X86DetourHook& hook,
+    std::string& error) {
+    error.clear();
+
+    auto* target = reinterpret_cast<std::uint8_t*>(module.base + kWa381MovementCollisionResultRva);
+    if (target[0] != 0x85
+        || target[1] != 0xC0
+        || target[2] != 0x74
+        || target[3] != 0x06
+        || target[4] != 0x33
+        || target[5] != 0xC0) {
+        std::ostringstream message;
+        message << "W:A movement collision result prologue did not match the expected 3.8.1 bytes at "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+                << " (RVA "
+                << formatAddress(kWa381MovementCollisionResultRva)
+                << "), actual "
+                << formatCodeBytes(target, 8);
+        error = message.str();
+        return false;
+    }
+
+    std::string stubError;
+    void* stub = buildWaMovementCollisionResultProbeStub(target, stubError);
+    if (stub == nullptr) {
+        error = stubError;
+        return false;
+    }
+
+    if (!hook.install(target, stub, kWaMovementCollisionResultPatchLength, error)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_movementCollisionResultProbeStub = stub;
+    InterlockedExchange(&g_movementCollisionResultProbeHits, 0);
+
+    std::ostringstream message;
+    message << "runtime probe: W:A movement collision result hook installed at "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+            << " using probe stub "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
+            << " (RVA "
+            << formatAddress(kWa381MovementCollisionResultRva)
+            << ")";
+    logger.info(message.str());
+    return true;
+}
+
+bool installWaMovementCollisionPathProbe(
+    Logger& logger,
+    const ProcessModuleView& module,
+    X86DetourHook& hook,
+    std::string& error) {
+    error.clear();
+
+    auto* target = reinterpret_cast<std::uint8_t*>(module.base + kWa381MovementCollisionPathRva);
+    if (target[0] != 0x3B
+        || target[1] != 0x7D
+        || target[2] != 0x08
+        || target[3] != 0x74
+        || target[4] != 0x46) {
+        std::ostringstream message;
+        message << "W:A movement collision path instruction did not match the expected 3.8.1 bytes at "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+                << " (RVA "
+                << formatAddress(kWa381MovementCollisionPathRva)
+                << "), actual "
+                << formatCodeBytes(target, 8);
+        error = message.str();
+        return false;
+    }
+
+    std::string stubError;
+    void* stub = buildWaMovementCollisionPathProbeStub(target, stubError);
+    if (stub == nullptr) {
+        error = stubError;
+        return false;
+    }
+
+    if (!hook.install(target, stub, kWaMovementCollisionPathPatchLength, error)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_movementCollisionPathProbeStub = stub;
+    InterlockedExchange(&g_movementCollisionPathProbeHits, 0);
+
+    std::ostringstream message;
+    message << "runtime probe: W:A movement collision path hook installed at "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+            << " using probe stub "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
+            << " (RVA "
+            << formatAddress(kWa381MovementCollisionPathRva)
+            << ")";
+    logger.info(message.str());
+    return true;
+}
+
+bool installWaMovementCollisionBranchProbe(
+    Logger& logger,
+    const ProcessModuleView& module,
+    X86DetourHook& hook,
+    std::string& error) {
+    error.clear();
+
+    auto* target = reinterpret_cast<std::uint8_t*>(module.base + kWa381MovementCollisionBranchRva);
+    if (target[0] != 0x8B
+        || target[1] != 0x7C
+        || target[2] != 0x24
+        || target[3] != 0x58
+        || target[4] != 0x8B
+        || target[5] != 0x37) {
+        std::ostringstream message;
+        message << "W:A movement collision branch instruction did not match the expected 3.8.1 bytes at "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+                << " (RVA "
+                << formatAddress(kWa381MovementCollisionBranchRva)
+                << "), actual "
+                << formatCodeBytes(target, 8);
+        error = message.str();
+        return false;
+    }
+
+    std::string stubError;
+    void* stub = buildWaMovementCollisionBranchProbeStub(target, stubError);
+    if (stub == nullptr) {
+        error = stubError;
+        return false;
+    }
+
+    if (!hook.install(target, stub, kWaMovementCollisionBranchPatchLength, error)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_movementCollisionBranchProbeStub = stub;
+    InterlockedExchange(&g_movementCollisionBranchProbeHits, 0);
+
+    std::ostringstream message;
+    message << "runtime probe: W:A movement collision branch hook installed at "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+            << " using probe stub "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
+            << " (RVA "
+            << formatAddress(kWa381MovementCollisionBranchRva)
+            << ")";
+    logger.info(message.str());
+    return true;
+}
+
+bool installWaCollisionQueryCommonProbe(
+    Logger& logger,
+    const ProcessModuleView& module,
+    X86DetourHook& hook,
+    std::string& error) {
+    error.clear();
+
+    auto* target = reinterpret_cast<std::uint8_t*>(module.base + kWa381CollisionQueryCommonRva);
+    if (target[0] != 0x83
+        || target[1] != 0xEC
+        || target[2] != 0x10
+        || target[3] != 0x53
+        || target[4] != 0x8B
+        || target[5] != 0x5C
+        || target[6] != 0x24
+        || target[7] != 0x18) {
+        std::ostringstream message;
+        message << "W:A collision query common prologue did not match the expected 3.8.1 bytes at "
+                << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+                << " (RVA "
+                << formatAddress(kWa381CollisionQueryCommonRva)
+                << "), actual "
+                << formatCodeBytes(target, 8);
+        error = message.str();
+        return false;
+    }
+
+    std::string stubError;
+    void* stub = buildWaCollisionQueryCommonProbeStub(target, stubError);
+    if (stub == nullptr) {
+        error = stubError;
+        return false;
+    }
+
+    if (!hook.install(target, stub, kWaCollisionQueryCommonPatchLength, error)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_collisionQueryCommonProbeStub = stub;
+    InterlockedExchange(&g_collisionQueryCommonProbeHits, 0);
+
+    std::ostringstream message;
+    message << "runtime probe: W:A collision query common hook installed at "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(target))
+            << " using probe stub "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(stub))
+            << " (RVA "
+            << formatAddress(kWa381CollisionQueryCommonRva)
             << ")";
     logger.info(message.str());
     return true;
@@ -4427,14 +5879,46 @@ void refreshDetectedMapCacheForActiveOverlay() {
     }
 
     std::size_t mapIndex = 0;
-    if (!direct3D9OverlayMapIndexForFileName(detectedFileName, mapIndex)
+    if (!direct3D9OverlayMapIndexForFileName(detectedPath, mapIndex)
         || static_cast<LONG>(mapIndex) != g_direct3D9ActiveOverlayMapIndex) {
         return;
     }
 
-    const std::uint64_t customDatWriteTime = fileWriteTimeUtc(g_customDatPath);
-    if (customDatWriteTime == 0
-        || customDatWriteTime == g_detectedMapCachedCustomDatWriteTime) {
+    const std::string customDatSha256 = sha256FileHex(g_customDatPath);
+    if (customDatSha256.empty()) {
+        return;
+    }
+
+    if (sameAsciiText(customDatSha256, g_detectedMapCachedCustomDatSha256)) {
+        return;
+    }
+
+    const bool associationPending = g_detectedMapCacheAssociationPending != 0;
+    const DWORD detectedMapTick = static_cast<DWORD>(g_detectedMapTick);
+    const bool detectedFromCache = g_detectedMapFromCacheSeed != 0;
+    const bool recentRealMapDetection = associationPending
+        && !detectedFromCache
+        && detectedMapTick != 0
+        && now - detectedMapTick <= kDetectedMapCacheRefreshWindowMilliseconds;
+    if (!recentRealMapDetection) {
+        {
+            std::lock_guard<std::mutex> lock(g_detectedMapMutex);
+            g_detectedMapPath.clear();
+            g_detectedMapFileName.clear();
+        }
+        InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
+        InterlockedExchange(&g_detectedMapCacheAssociationPending, 0);
+        InterlockedIncrement(&g_detectedMapSequence);
+        clearDirect3D9OverlayMap("custom.dat changed without a recent metadata map detection");
+        writeDetectedMapCache("", "", false);
+
+        if (g_runtimeProbeLogger != nullptr && g_detectedMapCacheRefreshLogCount < 8) {
+            InterlockedIncrement(&g_detectedMapCacheRefreshLogCount);
+
+            std::ostringstream message;
+            message << "runtime probe: deactivated wall map cache because custom.dat changed without a recent metadata map detection";
+            g_runtimeProbeLogger->info(message.str());
+        }
         return;
     }
 
@@ -4453,9 +5937,17 @@ void refreshDetectedMapCacheForActiveOverlay() {
 
 void seedDetectedMapFromCacheIfCurrent() {
     if (g_cachedDefaultMapPath.empty()
+        || g_cachedDefaultMapCustomDatSha256.empty()
         || g_direct3D9ActiveOverlayMapIndex >= 0
         || g_direct3D9OverlayMaps.empty()) {
         return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_detectedMapMutex);
+        if (!g_detectedMapPath.empty() || !g_detectedMapFileName.empty()) {
+            return;
+        }
     }
 
     const DWORD now = GetTickCount();
@@ -4465,12 +5957,10 @@ void seedDetectedMapFromCacheIfCurrent() {
     }
     InterlockedExchange(&g_cachedDefaultMapSeedAttemptTick, static_cast<LONG>(now));
 
-    if (g_cachedDefaultMapCustomDatWriteTime != 0) {
-        const std::uint64_t currentCustomDatWriteTime = fileWriteTimeUtc(g_customDatPath);
-        if (currentCustomDatWriteTime != 0
-            && currentCustomDatWriteTime != g_cachedDefaultMapCustomDatWriteTime) {
-            return;
-        }
+    const std::string currentCustomDatSha256 = sha256FileHex(g_customDatPath);
+    if (currentCustomDatSha256.empty()
+        || !sameAsciiText(currentCustomDatSha256, g_cachedDefaultMapCustomDatSha256)) {
+        return;
     }
 
     const LONG previousSequence = g_detectedMapSequence;
@@ -4478,6 +5968,8 @@ void seedDetectedMapFromCacheIfCurrent() {
     if (g_detectedMapSequence == previousSequence) {
         return;
     }
+    InterlockedExchange(&g_detectedMapFromCacheSeed, 1);
+    InterlockedExchange(&g_detectedMapCacheAssociationPending, 0);
 
     if (g_runtimeProbeLogger != nullptr && g_cachedDefaultMapSeedLogCount < 8) {
         InterlockedIncrement(&g_cachedDefaultMapSeedLogCount);
@@ -4502,20 +5994,22 @@ void syncDirect3D9OverlayMapFromDetectedFile() {
         return;
     }
 
+    std::string detectedPath;
     std::string detectedFileName;
     {
         std::lock_guard<std::mutex> lock(g_detectedMapMutex);
+        detectedPath = g_detectedMapPath;
         detectedFileName = g_detectedMapFileName;
     }
 
-    if (detectedFileName.empty()) {
+    if (detectedPath.empty() || detectedFileName.empty()) {
         clearDirect3D9OverlayMap("no detected map file");
         InterlockedExchange(&g_consumedMapSequence, detectedSequence);
         return;
     }
 
     std::size_t mapIndex = 0;
-    if (!direct3D9OverlayMapIndexForFileName(detectedFileName, mapIndex)) {
+    if (!direct3D9OverlayMapIndexForFileName(detectedPath, mapIndex)) {
         clearDirect3D9OverlayMap("detected map has no wall metadata");
         if (g_runtimeProbeLogger != nullptr && g_direct3D9OverlayActivationLogCount < 32) {
             InterlockedIncrement(&g_direct3D9OverlayActivationLogCount);
@@ -4523,7 +6017,7 @@ void syncDirect3D9OverlayMapFromDetectedFile() {
             std::ostringstream message;
             message << "runtime probe: no wall metadata matched detected map file \""
                     << detectedFileName
-                    << "\"; overlay remains passive";
+                    << "\"; overlay deactivated";
             g_runtimeProbeLogger->info(message.str());
         }
         InterlockedExchange(&g_consumedMapSequence, detectedSequence);
@@ -4536,6 +6030,10 @@ void syncDirect3D9OverlayMapFromDetectedFile() {
 
 bool metadataOverlayCameraWithinMapBounds(const CameraTrackingSnapshot& camera) {
     if (!camera.available) {
+        return false;
+    }
+
+    if (camera.xPixels == 0 && camera.yPixels == 0) {
         return false;
     }
 
@@ -5162,234 +6660,12 @@ void drawDirect3D9ActiveWormCandidateOverlayTest(IDirect3DDevice9* device) {
     }
 }
 
-bool pointInsideExpandedRect(int x, int y, const Direct3D9OverlayRect& rect, int radius) {
-    return x >= rect.left - radius
-        && x <= rect.right + radius
-        && y >= rect.top - radius
-        && y <= rect.bottom + radius;
-}
-
-bool clipSegmentAxis(double p, double q, double& t0, double& t1) {
-    if (p == 0.0) {
-        return q >= 0.0;
-    }
-
-    const double r = q / p;
-    if (p < 0.0) {
-        if (r > t1) {
-            return false;
-        }
-        if (r > t0) {
-            t0 = r;
-        }
-    } else {
-        if (r < t0) {
-            return false;
-        }
-        if (r < t1) {
-            t1 = r;
-        }
-    }
-
-    return true;
-}
-
-bool segmentIntersectsExpandedRect(
-    int x0,
-    int y0,
-    int x1,
-    int y1,
-    const Direct3D9OverlayRect& rect,
-    int radius) {
-    if (pointInsideExpandedRect(x0, y0, rect, radius)
-        || pointInsideExpandedRect(x1, y1, rect, radius)) {
-        return true;
-    }
-
-    const double left = static_cast<double>(rect.left - radius);
-    const double right = static_cast<double>(rect.right + radius);
-    const double top = static_cast<double>(rect.top - radius);
-    const double bottom = static_cast<double>(rect.bottom + radius);
-    const double dx = static_cast<double>(x1 - x0);
-    const double dy = static_cast<double>(y1 - y0);
-
-    double t0 = 0.0;
-    double t1 = 1.0;
-    return clipSegmentAxis(-dx, static_cast<double>(x0) - left, t0, t1)
-        && clipSegmentAxis(dx, right - static_cast<double>(x0), t0, t1)
-        && clipSegmentAxis(-dy, static_cast<double>(y0) - top, t0, t1)
-        && clipSegmentAxis(dy, bottom - static_cast<double>(y0), t0, t1);
-}
-
-bool rangesOverlap(int leftA, int rightA, int leftB, int rightB) {
-    return leftA <= rightB && leftB <= rightA;
-}
-
-bool bounceNearExpandedRect(
-    int olderX,
-    int olderY,
-    int previousX,
-    int previousY,
-    int currentX,
-    int currentY,
-    const Direct3D9OverlayRect& rect,
-    int radius) {
-    const int beforeX = previousX - olderX;
-    const int afterX = currentX - previousX;
-    const int beforeY = previousY - olderY;
-    const int afterY = currentY - previousY;
-    const int minVelocity = kMinWallTouchBounceVelocityPixels;
-
-    const int minX = std::min(olderX, std::min(previousX, currentX));
-    const int maxX = std::max(olderX, std::max(previousX, currentX));
-    const int minY = std::min(olderY, std::min(previousY, currentY));
-    const int maxY = std::max(olderY, std::max(previousY, currentY));
-
-    const bool yOverlapsWall = rangesOverlap(
-        minY,
-        maxY,
-        static_cast<int>(rect.top) - radius,
-        static_cast<int>(rect.bottom) + radius);
-    if (yOverlapsWall && beforeX > minVelocity && afterX < -minVelocity) {
-        const int distance = static_cast<int>(rect.left) - maxX;
-        if (distance >= 0 && distance <= radius) {
-            return true;
-        }
-    }
-    if (yOverlapsWall && beforeX < -minVelocity && afterX > minVelocity) {
-        const int distance = minX - static_cast<int>(rect.right);
-        if (distance >= 0 && distance <= radius) {
-            return true;
-        }
-    }
-
-    const bool xOverlapsWall = rangesOverlap(
-        minX,
-        maxX,
-        static_cast<int>(rect.left) - radius,
-        static_cast<int>(rect.right) + radius);
-    if (xOverlapsWall && beforeY > minVelocity && afterY < -minVelocity) {
-        const int distance = static_cast<int>(rect.top) - maxY;
-        if (distance >= 0 && distance <= radius) {
-            return true;
-        }
-    }
-    if (xOverlapsWall && beforeY < -minVelocity && afterY > minVelocity) {
-        const int distance = minY - static_cast<int>(rect.bottom);
-        if (distance >= 0 && distance <= radius) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 void updateTouchedOverlayWallsFromActiveWorm() {
     if (g_direct3D9OverlayTestRects.empty()) {
         return;
     }
 
-    resetTouchedOverlayWallsWhenActiveTeamChanges();
     refreshActiveWormCandidateFromTrackingTarget();
-
-    int olderX = 0;
-    int olderY = 0;
-    int previousX = 0;
-    int previousY = 0;
-    int activeX = 0;
-    int activeY = 0;
-    bool hasOlder = false;
-    bool usedTrackingFallback = false;
-    if (!readActiveWormCandidateSweepPixels(
-            olderX,
-            olderY,
-            previousX,
-            previousY,
-            activeX,
-            activeY,
-            hasOlder,
-            usedTrackingFallback)) {
-        return;
-    }
-
-    const int touchRadius = usedTrackingFallback
-        ? std::max(g_direct3D9OverlayTransform.touchRadiusPixels, kTrackingFallbackTouchRadiusPixels)
-        : std::max(g_direct3D9OverlayTransform.touchRadiusPixels, kActiveWormTouchRadiusPixels);
-    const int bounceRadius = std::max(touchRadius, kWallTouchBounceRadiusPixels);
-    const int movementDistance = std::abs(activeX - previousX) + std::abs(activeY - previousY);
-    const bool canUseSweep = movementDistance > 0 && movementDistance <= kMaxWallTouchSweepPixels;
-    const int olderMovementDistance = std::abs(previousX - olderX) + std::abs(previousY - olderY);
-    const bool canUseBounce = hasOlder
-        && movementDistance > 0
-        && olderMovementDistance > 0
-        && movementDistance <= kMaxWallTouchSweepPixels
-        && olderMovementDistance <= kMaxWallTouchSweepPixels;
-    for (Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
-        if (rect.touched) {
-            continue;
-        }
-
-        const bool pointTouch = pointInsideExpandedRect(activeX, activeY, rect, touchRadius);
-        const bool sweepTouch = !pointTouch
-            && canUseSweep
-            && segmentIntersectsExpandedRect(previousX, previousY, activeX, activeY, rect, touchRadius);
-        const bool bounceTouch = !pointTouch
-            && !sweepTouch
-            && canUseBounce
-            && bounceNearExpandedRect(olderX, olderY, previousX, previousY, activeX, activeY, rect, bounceRadius);
-        if (!pointTouch && !sweepTouch && !bounceTouch) {
-            continue;
-        }
-
-        rect.touched = true;
-        InterlockedExchange(&g_wallTouchLastTouchTick, static_cast<LONG>(GetTickCount()));
-        if (usedTrackingFallback) {
-            rememberFallbackWallTouchTurn();
-        } else {
-            rememberActiveWallTouchTurn();
-        }
-
-        if (g_runtimeProbeLogger != nullptr && g_direct3D9WallTouchLogCount < 64) {
-            InterlockedIncrement(&g_direct3D9WallTouchLogCount);
-
-            std::ostringstream message;
-            message << "runtime probe: wall touched by active worm, wall "
-                    << rect.wallIndex
-                    << " method "
-                    << (bounceTouch ? "bounce" : (sweepTouch ? "sweep" : "point"))
-                    << " rect "
-                    << rect.left
-                    << ","
-                    << rect.top
-                    << "-"
-                    << rect.right
-                    << ","
-                    << rect.bottom
-                    << " active "
-                    << activeX
-                    << ","
-                    << activeY
-                    << " previous "
-                    << previousX
-                    << ","
-                    << previousY
-                    << " older "
-                    << olderX
-                    << ","
-                    << olderY
-                    << " movement "
-                    << movementDistance
-                    << " olderMovement "
-                    << olderMovementDistance
-                    << " radius "
-                    << touchRadius
-                    << " bounceRadius "
-                    << bounceRadius
-                    << " trackingFallback "
-                    << (usedTrackingFallback ? "yes" : "no");
-            g_runtimeProbeLogger->info(message.str());
-        }
-    }
 }
 
 bool prepareMetadataOverlayScreenRects(
@@ -5856,6 +7132,53 @@ bool directDrawSurfaceTransitionCooldownActive() {
     return GetTickCount() - transitionTick < kDirectDrawSurfaceTransitionDrawCooldownMilliseconds;
 }
 
+HRESULT getDirectDrawSurfaceDescription(
+    void* surface,
+    const DirectDrawSurfaceVtableHook& hook,
+    DWORD& width,
+    DWORD& height,
+    DWORD& caps,
+    DDPIXELFORMAT& pixelFormat) {
+    width = 0;
+    height = 0;
+    caps = 0;
+    pixelFormat = {};
+
+    if (surface == nullptr) {
+        return E_POINTER;
+    }
+
+    if (hook.usesSurfaceDesc2) {
+        auto* directDrawSurface = reinterpret_cast<IDirectDrawSurface7*>(surface);
+        DDSURFACEDESC2 surfaceDescription = {};
+        surfaceDescription.dwSize = sizeof(surfaceDescription);
+        const HRESULT result = directDrawSurface->GetSurfaceDesc(&surfaceDescription);
+        if (FAILED(result)) {
+            return result;
+        }
+
+        width = surfaceDescription.dwWidth;
+        height = surfaceDescription.dwHeight;
+        caps = surfaceDescription.ddsCaps.dwCaps;
+        pixelFormat = surfaceDescription.ddpfPixelFormat;
+        return result;
+    }
+
+    auto* directDrawSurface = reinterpret_cast<IDirectDrawSurface*>(surface);
+    DDSURFACEDESC surfaceDescription = {};
+    surfaceDescription.dwSize = sizeof(surfaceDescription);
+    const HRESULT result = directDrawSurface->GetSurfaceDesc(&surfaceDescription);
+    if (FAILED(result)) {
+        return result;
+    }
+
+    width = surfaceDescription.dwWidth;
+    height = surfaceDescription.dwHeight;
+    caps = surfaceDescription.ddsCaps.dwCaps;
+    pixelFormat = surfaceDescription.ddpfPixelFormat;
+    return result;
+}
+
 void drawDirectDrawOverlayTestRects(
     void* surface,
     const DirectDrawSurfaceVtableHook& hook,
@@ -5872,11 +7195,18 @@ void drawDirectDrawOverlayTestRects(
         return;
     }
 
-    auto* directDrawSurface = reinterpret_cast<IDirectDrawSurface*>(surface);
-    DDSURFACEDESC surfaceDescription = {};
-    surfaceDescription.dwSize = sizeof(surfaceDescription);
-    HRESULT result = directDrawSurface->GetSurfaceDesc(&surfaceDescription);
-    if (FAILED(result) || surfaceDescription.dwWidth == 0 || surfaceDescription.dwHeight == 0) {
+    DWORD surfaceWidth = 0;
+    DWORD surfaceHeight = 0;
+    DWORD surfaceCaps = 0;
+    DDPIXELFORMAT pixelFormat = {};
+    HRESULT result = getDirectDrawSurfaceDescription(
+        surface,
+        hook,
+        surfaceWidth,
+        surfaceHeight,
+        surfaceCaps,
+        pixelFormat);
+    if (FAILED(result) || surfaceWidth == 0 || surfaceHeight == 0) {
         const LONG failures = InterlockedIncrement(&g_directDrawOverlayFailureHits);
         if (failures == 1 && g_runtimeProbeLogger != nullptr) {
             std::ostringstream message;
@@ -5890,8 +7220,8 @@ void drawDirectDrawOverlayTestRects(
         return;
     }
 
-    const LONG width = static_cast<LONG>(surfaceDescription.dwWidth);
-    const LONG height = static_cast<LONG>(surfaceDescription.dwHeight);
+    const LONG width = static_cast<LONG>(surfaceWidth);
+    const LONG height = static_cast<LONG>(surfaceHeight);
 
     std::vector<ScreenOverlayRect> screenRects;
     const bool prepared = prepareMetadataOverlayScreenRects(
@@ -5918,7 +7248,7 @@ void drawDirectDrawOverlayTestRects(
             ++attempted;
             DDBLTFX effects = {};
             effects.dwSize = sizeof(effects);
-            effects.dwFillColor = directDrawFillColorFromArgb(rect.color, surfaceDescription.ddpfPixelFormat);
+            effects.dwFillColor = directDrawFillColorFromArgb(rect.color, pixelFormat);
             result = hook.originalBlt(
                 surface,
                 &target,
@@ -5947,7 +7277,9 @@ void drawDirectDrawOverlayTestRects(
                     << " on surface "
                     << formatAddress(reinterpret_cast<std::uintptr_t>(surface))
                     << ", caps "
-                    << formatHex32(surfaceDescription.ddsCaps.dwCaps)
+                    << formatHex32(surfaceCaps)
+                    << ", desc "
+                    << (hook.usesSurfaceDesc2 ? "DDSURFACEDESC2" : "DDSURFACEDESC")
                     << ", size "
                     << width
                     << "x"
@@ -5985,7 +7317,7 @@ void drawDirectDrawOverlayTestRects(
     }
 }
 
-bool installDirectDrawSurfaceProbe(void* surface) {
+bool installDirectDrawSurfaceProbe(void* surface, bool usesSurfaceDesc2) {
     if (surface == nullptr) {
         return false;
     }
@@ -6003,6 +7335,7 @@ bool installDirectDrawSurfaceProbe(void* surface) {
 
     DirectDrawSurfaceVtableHook hook;
     hook.vtable = vtable;
+    hook.usesSurfaceDesc2 = usesSurfaceDesc2;
     hook.originalBlt = reinterpret_cast<DirectDrawSurfaceBltFunction>(vtable[kDirectDrawSurfaceBltIndex]);
     hook.originalBltFast = reinterpret_cast<DirectDrawSurfaceBltFastFunction>(vtable[kDirectDrawSurfaceBltFastIndex]);
     hook.originalFlip = reinterpret_cast<DirectDrawSurfaceFlipFunction>(vtable[kDirectDrawSurfaceFlipIndex]);
@@ -6052,7 +7385,9 @@ bool installDirectDrawSurfaceProbe(void* surface) {
         message << "runtime probe: DirectDraw surface vtable probe installed for surface "
                 << formatAddress(reinterpret_cast<std::uintptr_t>(surface))
                 << ", vtable "
-                << formatAddress(reinterpret_cast<std::uintptr_t>(vtable));
+                << formatAddress(reinterpret_cast<std::uintptr_t>(vtable))
+                << ", desc "
+                << (usesSurfaceDesc2 ? "DDSURFACEDESC2" : "DDSURFACEDESC");
         g_runtimeProbeLogger->info(message.str());
     }
 
@@ -6164,7 +7499,7 @@ HRESULT STDMETHODCALLTYPE hookedDirectDrawCreateSurface(
     const LONG hits = InterlockedIncrement(&g_directDrawCreateSurfaceProbeHits);
     HRESULT result = hook.originalCreateSurface(directDraw, surfaceDescription, surface, outer);
     if (SUCCEEDED(result) && surface != nullptr && *surface != nullptr) {
-        installDirectDrawSurfaceProbe(*surface);
+        installDirectDrawSurfaceProbe(*surface, false);
         if (surfaceDescription != nullptr) {
             const DWORD flags = surfaceDescription->dwFlags;
             const DWORD width = (flags & DDSD_WIDTH) != 0 ? surfaceDescription->dwWidth : 0;
@@ -6214,7 +7549,7 @@ HRESULT STDMETHODCALLTYPE hookedDirectDraw7CreateSurface(
     const LONG hits = InterlockedIncrement(&g_directDrawCreateSurfaceProbeHits);
     HRESULT result = hook.originalCreateSurface7(directDraw, surfaceDescription, surface, outer);
     if (SUCCEEDED(result) && surface != nullptr && *surface != nullptr) {
-        installDirectDrawSurfaceProbe(*surface);
+        installDirectDrawSurfaceProbe(*surface, true);
         if (surfaceDescription != nullptr) {
             const DWORD flags = surfaceDescription->dwFlags;
             const DWORD width = (flags & DDSD_WIDTH) != 0 ? surfaceDescription->dwWidth : 0;
@@ -6354,13 +7689,17 @@ HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceUnlock(void* surface, void* sur
     }
 
     if (hits <= 16 && g_runtimeProbeLogger != nullptr) {
-        DDSURFACEDESC surfaceDescription = {};
-        surfaceDescription.dwSize = sizeof(surfaceDescription);
-        HRESULT descriptionResult = E_FAIL;
-        if (surface != nullptr) {
-            auto* directDrawSurface = reinterpret_cast<IDirectDrawSurface*>(surface);
-            descriptionResult = directDrawSurface->GetSurfaceDesc(&surfaceDescription);
-        }
+        DWORD surfaceWidth = 0;
+        DWORD surfaceHeight = 0;
+        DWORD surfaceCaps = 0;
+        DDPIXELFORMAT pixelFormat = {};
+        const HRESULT descriptionResult = getDirectDrawSurfaceDescription(
+            surface,
+            hook,
+            surfaceWidth,
+            surfaceHeight,
+            surfaceCaps,
+            pixelFormat);
 
         std::ostringstream message;
         message << "runtime probe: DirectDrawSurface::Unlock hook fired with HRESULT "
@@ -6371,11 +7710,13 @@ HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceUnlock(void* surface, void* sur
                 << formatAddress(reinterpret_cast<std::uintptr_t>(surfaceData));
         if (SUCCEEDED(descriptionResult)) {
             message << ", caps "
-                    << formatHex32(surfaceDescription.ddsCaps.dwCaps)
+                    << formatHex32(surfaceCaps)
+                    << ", desc "
+                    << (hook.usesSurfaceDesc2 ? "DDSURFACEDESC2" : "DDSURFACEDESC")
                     << ", size "
-                    << surfaceDescription.dwWidth
+                    << surfaceWidth
                     << "x"
-                    << surfaceDescription.dwHeight;
+                    << surfaceHeight;
         }
         g_runtimeProbeLogger->info(message.str());
     }
@@ -6607,7 +7948,7 @@ HRESULT STDMETHODCALLTYPE hookedD3D9DeviceReset(
         return D3DERR_INVALIDCALL;
     }
 
-    resetTransientGameplayTrackingState("D3D context transition", false);
+    resetTransientGameplayTrackingState("D3D context transition", true);
 
     HRESULT result = originalReset(device, presentationParameters);
     if (hits <= 8 && g_runtimeProbeLogger != nullptr) {
@@ -7689,7 +9030,9 @@ bool WaHookManager::initialize(
     g_customDatPath = direct3D9OverlayTransform.customDatPath;
     g_cachedDefaultMapPath = direct3D9OverlayTransform.cachedMapPath;
     g_cachedDefaultMapCustomDatWriteTime = direct3D9OverlayTransform.cachedMapCustomDatWriteTime;
+    g_cachedDefaultMapCustomDatSha256 = direct3D9OverlayTransform.cachedMapCustomDatSha256;
     g_detectedMapCachedCustomDatWriteTime = direct3D9OverlayTransform.cachedMapCustomDatWriteTime;
+    g_detectedMapCachedCustomDatSha256 = direct3D9OverlayTransform.cachedMapCustomDatSha256;
     g_direct3D9OverlayTestRects.clear();
     g_direct3D9OverlayTestRects.reserve(direct3D9OverlayTestRects.size());
     for (const WaOverlayRect& rect : direct3D9OverlayTestRects) {
@@ -7745,20 +9088,24 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_direct3D9MetadataOverlayCameraDeltaLogCount, 0);
     InterlockedExchange(&g_direct3D9WallTouchLogCount, 0);
     InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
-    InterlockedExchange(&g_wallTouchTurnTeamByte, kUnknownWallTouchTurnTeamByte);
-    InterlockedExchange(&g_wallTouchTurnFallbackTouchTick, 0);
     InterlockedExchange(&g_wallTouchResetLogCount, 0);
     InterlockedExchange(&g_wallTouchLastTouchTick, 0);
     InterlockedExchange(&g_wallTouchLastResetTick, 0);
     InterlockedExchange(&g_waStateUiAddress, 0);
     InterlockedExchange(&g_waStateUiLogCount, 0);
-    InterlockedExchange(&g_gameTimerTransitionProbeHits, 0);
-    InterlockedExchange(&g_gameTimerTransitionLogCount, 0);
-    InterlockedExchange(&g_gameTimerTransitionStateAddress, 0);
-    InterlockedExchange(&g_gameTimerTransitionLastState, -1);
+    InterlockedExchange(&g_movementCollisionResultProbeHits, 0);
+    InterlockedExchange(&g_movementResolutionResultProbeHits, 0);
+    InterlockedExchange(&g_movementResolutionResultLogCount, 0);
+    InterlockedExchange(&g_movementResolutionResultNearWallLogCount, 0);
+    InterlockedExchange(&g_turnGameHandleMessageProbeHits, 0);
+    InterlockedExchange(&g_turnGameHandleMessageLogCount, 0);
+    InterlockedExchange(&g_turnGameFinishTurnLastResetTick, 0);
+    g_originalWaTurnGameHandleMessage = nullptr;
     InterlockedExchange(&g_detectedMapSequence, 0);
     InterlockedExchange(&g_consumedMapSequence, 0);
     InterlockedExchange(&g_detectedMapTick, 0);
+    InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
+    InterlockedExchange(&g_detectedMapCacheAssociationPending, 0);
     InterlockedExchange(&g_direct3D9ActiveOverlayMapIndex, -1);
     InterlockedExchange(&g_detectedMapLogCount, 0);
     InterlockedExchange(&g_detectedMapCacheRefreshTick, 0);
@@ -7832,6 +9179,13 @@ bool WaHookManager::initialize(
         }
     }
 
+    {
+        std::string turnGameError;
+        if (!installWaTurnGameHandleMessageProbe(logger, module, turnGameHandleMessageHook_, turnGameError)) {
+            logger.warn("runtime probe: failed to install CTaskTurnGame::HandleMessage hook: " + turnGameError);
+        }
+    }
+
     if (enableCameraProbe) {
         std::string cameraError;
         if (!installWaCameraTrackingProbe(logger, module, cameraTrackingHook_, cameraError)) {
@@ -7848,6 +9202,40 @@ bool WaHookManager::initialize(
 
         if (!installWaWormMotionCandidateProbe(logger, module, wormMotionCandidateHook_, cameraError)) {
             logger.warn("runtime probe: failed to install W:A worm motion candidate hook: " + cameraError);
+        }
+
+        if (!installWaMovementCollisionResultProbe(logger, module, movementCollisionResultHook_, cameraError)) {
+            logger.warn("runtime probe: failed to install W:A movement collision result hook: " + cameraError);
+        }
+
+        if (!installWaMovementCollisionPathProbe(logger, module, movementCollisionPathHook_, cameraError)) {
+            logger.warn("runtime probe: failed to install W:A movement collision path hook: " + cameraError);
+        }
+
+        if (!installWaMovementCollisionBranchProbe(logger, module, movementCollisionBranchHook_, cameraError)) {
+            logger.warn("runtime probe: failed to install W:A movement collision branch hook: " + cameraError);
+        }
+
+        if (!installWaCollisionQueryCommonProbe(logger, module, collisionQueryCommonHook_, cameraError)) {
+            logger.warn("runtime probe: failed to install W:A collision query common hook: " + cameraError);
+        }
+
+        if (!installWaMovementResolutionResultProbe(
+                logger,
+                module,
+                movementResolutionSecondaryResultHook_,
+                kWa381MovementResolutionSecondaryResultRva,
+                0x17,
+                {0x85, 0xC0, 0x74, 0x13, 0x8B, 0x4C, 0x24, 0x1C},
+                {0x8B, 0x4C, 0x24, 0x1C},
+                g_movementResolutionSecondaryResultProbeStub,
+                "movement resolution secondary result",
+                cameraError)) {
+            logger.warn("runtime probe: failed to install W:A movement resolution secondary result hook: " + cameraError);
+        }
+
+        if (!installWaJumpTerrainCollisionResultProbe(logger, module, jumpTerrainCollisionResultHook_, cameraError)) {
+            logger.warn("runtime probe: failed to install W:A jump terrain collision result hook: " + cameraError);
         }
     }
 
