@@ -56,11 +56,29 @@ User\Walls
 
 It is relative to the Worms Armageddon folder unless you set an absolute path in `wkWall2Wall.ini`.
 
+Default touch sounds are loaded from:
+
+```text
+User\Walls\Sounds
+```
+
+You can replace the `.wav` files or edit the `[Sounds]` section in `wkWall2Wall.ini`.
+
 Worms Armageddon maps should stay in the normal W:A user map location:
 
 ```text
 Worms Armageddon\User\SavedLevels
 ```
+
+## Sample Assets
+
+The repository includes a small example under `User\`:
+
+- one map in `User\SavedLevels`
+- matching wall metadata in `User\Walls`
+- default wall-touch sounds in `User\Walls\Sounds`
+
+These files are meant as a reference for players and packagers. To try them in W:A, copy the `User\` contents into your Worms Armageddon `User\` folder.
 
 ## Creating Wall Metadata
 

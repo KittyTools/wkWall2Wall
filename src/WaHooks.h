@@ -2,6 +2,7 @@
 
 #include "Logger.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -44,6 +45,14 @@ struct WaOverlayMap {
     int width = 0;
     int height = 0;
     std::vector<WaOverlayRect> rects;
+};
+
+struct WaSoundConfig {
+    bool enabled = true;
+    int volumePercent = 100;
+    std::array<std::string, 5> wallTouchedSoundPaths;
+    std::string wallTouchedExtraSoundPath;
+    std::string allWallsTouchedSoundPath;
 };
 
 class X86DetourHook {
@@ -109,10 +118,12 @@ public:
         const std::vector<WaOverlayRect>& direct3D9OverlayTestRects,
         const std::vector<WaOverlayMap>& direct3D9OverlayMaps,
         const WaOverlayTransform& direct3D9OverlayTransform,
+        const WaSoundConfig& soundConfig,
         std::string& error);
 
 private:
     IatHook getMessageHook_;
+    IatHook peekMessageHook_;
     IatHook swapBuffersHook_;
     IatHook bitBltHook_;
     IatHook stretchBltHook_;

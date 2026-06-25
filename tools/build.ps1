@@ -50,6 +50,7 @@ $arguments = @(
     "-lopengl32",
     "-ladvapi32",
     "-lversion",
+    "-lwinmm",
     "-static",
     "-Wl,--exclude-all-symbols"
 )

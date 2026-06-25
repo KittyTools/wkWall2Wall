@@ -7,6 +7,7 @@
 #include <d3d9.h>
 #include <ddraw.h>
 #include <gl/GL.h>
+#include <mmsystem.h>
 #include <wincrypt.h>
 
 #include <algorithm>
@@ -15,6 +16,8 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -249,6 +252,7 @@ void logProbeSignatureMatches(Logger& logger, const ProcessModuleView& module) {
 }
 
 using GetMessageAFunction = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT);
+using PeekMessageAFunction = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT, UINT);
 using SwapBuffersFunction = BOOL(WINAPI*)(HDC);
 using BitBltFunction = BOOL(WINAPI*)(HDC, int, int, int, int, HDC, int, int, DWORD);
 using StretchBltFunction = BOOL(WINAPI*)(HDC, int, int, int, int, HDC, int, int, int, int, DWORD);
@@ -264,6 +268,7 @@ using WaTurnGameHandleMessageFunction =
     int(__fastcall*)(void*, void*, void*, std::uint32_t, std::size_t, void*);
 
 GetMessageAFunction g_originalGetMessageA = nullptr;
+PeekMessageAFunction g_originalPeekMessageA = nullptr;
 SwapBuffersFunction g_originalSwapBuffers = nullptr;
 BitBltFunction g_originalBitBlt = nullptr;
 StretchBltFunction g_originalStretchBlt = nullptr;
@@ -278,6 +283,7 @@ OpenGLEndFunction g_originalOpenGLEnd = nullptr;
 WaTurnGameHandleMessageFunction g_originalWaTurnGameHandleMessage = nullptr;
 Logger* g_runtimeProbeLogger = nullptr;
 volatile LONG g_getMessageProbeHits = 0;
+volatile LONG g_peekMessageProbeHits = 0;
 volatile LONG g_swapBuffersProbeHits = 0;
 volatile LONG g_bitBltProbeHits = 0;
 volatile LONG g_stretchBltProbeHits = 0;
@@ -610,6 +616,7 @@ std::vector<DirectDrawSurfaceVtableHook> g_directDrawSurfaceVtableHooks;
 std::vector<Direct3D9OverlayRect> g_direct3D9OverlayTestRects;
 std::vector<WaOverlayMap> g_direct3D9OverlayMaps;
 WaOverlayTransform g_direct3D9OverlayTransform;
+WaSoundConfig g_soundConfig;
 std::mutex g_detectedMapMutex;
 std::string g_detectedMapPath;
 std::string g_detectedMapFileName;
@@ -634,9 +641,31 @@ volatile LONG g_cachedDefaultMapSeedLogCount = 0;
 volatile LONG g_direct3D9OverlayActivationLogCount = 0;
 volatile LONG g_direct3D9OverlayGameplayActive = 0;
 volatile LONG g_direct3D9OverlayGameplayLogCount = 0;
+volatile LONG g_wallSoundLogCount = 0;
+volatile LONG g_wallSoundMissingLogCount = 0;
+volatile LONG g_chatOverlayActive = 0;
+volatile LONG g_chatOverlayHiddenLogCount = 0;
+volatile LONG g_chatInputLogCount = 0;
+volatile LONG g_chatOverlayScanPendingTick = 0;
+volatile LONG g_chatOverlayDetectedOffsetY = 0;
+volatile LONG g_chatOverlayDetectedOffsetValid = 0;
+volatile LONG g_chatOverlayScanLogCount = 0;
+volatile LONG g_chatOverlayScanSampleCount = 0;
+volatile LONG g_chatOverlayControlKeyActive = 0;
+volatile LONG g_chatOverlayPinnedMode = 0;
+volatile LONG g_chatOverlayPinnedPending = 0;
+volatile LONG g_chatOverlayPinnedActivationTick = 0;
+volatile LONG g_chatOverlayPinnedAutoProbeTick = 0;
+volatile LONG g_chatOverlayLastUnpinnedCameraYPixels = 0;
+volatile LONG g_chatOverlayPinnedCameraOffsetY = LONG_MIN;
+volatile LONG g_chatOverlayPinnedBaselineBaseY = LONG_MIN;
+volatile LONG g_chatOverlayLastUnpinnedBaseY = LONG_MIN;
+std::array<LONG, 5> g_chatOverlayScanSamples = {};
 
 TrackingTargetSnapshot currentTrackingTargetSnapshot();
 bool waObjectCurrentTeamMatches(void* owner);
+void activateChatOverlayPinnedMode();
+void activatePendingChatOverlayPinnedModeIfReady();
 
 ULONG STDMETHODCALLTYPE hookedD3D9DeviceRelease(IDirect3DDevice9* device) noexcept;
 HRESULT STDMETHODCALLTYPE hookedD3D9DeviceReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* presentationParameters) noexcept;
@@ -1469,6 +1498,241 @@ std::size_t touchedOverlayWallCount() {
     return count;
 }
 
+bool wallSoundFileExists(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const DWORD attributes = GetFileAttributesA(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::uint16_t readLe16(const std::vector<BYTE>& bytes, std::size_t offset) {
+    return static_cast<std::uint16_t>(bytes[offset])
+        | (static_cast<std::uint16_t>(bytes[offset + 1]) << 8);
+}
+
+std::uint32_t readLe32(const std::vector<BYTE>& bytes, std::size_t offset) {
+    return static_cast<std::uint32_t>(bytes[offset])
+        | (static_cast<std::uint32_t>(bytes[offset + 1]) << 8)
+        | (static_cast<std::uint32_t>(bytes[offset + 2]) << 16)
+        | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+}
+
+bool chunkIdEquals(const std::vector<BYTE>& bytes, std::size_t offset, const char* id) {
+    return offset + 4 <= bytes.size()
+        && bytes[offset] == static_cast<BYTE>(id[0])
+        && bytes[offset + 1] == static_cast<BYTE>(id[1])
+        && bytes[offset + 2] == static_cast<BYTE>(id[2])
+        && bytes[offset + 3] == static_cast<BYTE>(id[3]);
+}
+
+bool loadPcmWaveFile(
+    const std::string& path,
+    int volumePercent,
+    WAVEFORMATEX& format,
+    std::vector<BYTE>& audioData) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    std::vector<BYTE> bytes(
+        (std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+    if (bytes.size() < 44
+        || !chunkIdEquals(bytes, 0, "RIFF")
+        || !chunkIdEquals(bytes, 8, "WAVE")) {
+        return false;
+    }
+
+    std::size_t fmtOffset = 0;
+    std::uint32_t fmtSize = 0;
+    std::size_t dataOffset = 0;
+    std::uint32_t dataSize = 0;
+    std::size_t offset = 12;
+    while (offset + 8 <= bytes.size()) {
+        const std::uint32_t chunkSize = readLe32(bytes, offset + 4);
+        const std::size_t chunkDataOffset = offset + 8;
+        if (chunkDataOffset + chunkSize > bytes.size()) {
+            break;
+        }
+
+        if (chunkIdEquals(bytes, offset, "fmt ")) {
+            fmtOffset = chunkDataOffset;
+            fmtSize = chunkSize;
+        } else if (chunkIdEquals(bytes, offset, "data")) {
+            dataOffset = chunkDataOffset;
+            dataSize = chunkSize;
+        }
+
+        offset = chunkDataOffset + chunkSize + (chunkSize & 1U);
+    }
+
+    if (fmtOffset == 0 || fmtSize < 16 || dataOffset == 0 || dataSize == 0) {
+        return false;
+    }
+
+    const std::uint16_t audioFormat = readLe16(bytes, fmtOffset);
+    const std::uint16_t channels = readLe16(bytes, fmtOffset + 2);
+    const std::uint32_t samplesPerSecond = readLe32(bytes, fmtOffset + 4);
+    const std::uint32_t averageBytesPerSecond = readLe32(bytes, fmtOffset + 8);
+    const std::uint16_t blockAlign = readLe16(bytes, fmtOffset + 12);
+    const std::uint16_t bitsPerSample = readLe16(bytes, fmtOffset + 14);
+    if (audioFormat != WAVE_FORMAT_PCM
+        || channels == 0
+        || samplesPerSecond == 0
+        || blockAlign == 0
+        || (bitsPerSample != 8 && bitsPerSample != 16)) {
+        return false;
+    }
+
+    format = {};
+    format.wFormatTag = WAVE_FORMAT_PCM;
+    format.nChannels = channels;
+    format.nSamplesPerSec = samplesPerSecond;
+    format.nAvgBytesPerSec = averageBytesPerSecond;
+    format.nBlockAlign = blockAlign;
+    format.wBitsPerSample = bitsPerSample;
+
+    audioData.assign(bytes.begin() + dataOffset, bytes.begin() + dataOffset + dataSize);
+    const int clampedVolume = std::max(0, std::min(100, volumePercent));
+    if (clampedVolume == 100) {
+        return true;
+    }
+
+    if (bitsPerSample == 16) {
+        for (std::size_t index = 0; index + 1 < audioData.size(); index += 2) {
+            const int sample = static_cast<short>(
+                static_cast<std::uint16_t>(audioData[index])
+                | (static_cast<std::uint16_t>(audioData[index + 1]) << 8));
+            const int scaled = (sample * clampedVolume) / 100;
+            const auto output = static_cast<std::int16_t>(std::max(-32768, std::min(32767, scaled)));
+            audioData[index] = static_cast<BYTE>(output & 0xFF);
+            audioData[index + 1] = static_cast<BYTE>((output >> 8) & 0xFF);
+        }
+    } else {
+        for (BYTE& sample : audioData) {
+            const int centered = static_cast<int>(sample) - 128;
+            const int scaled = (centered * clampedVolume) / 100;
+            sample = static_cast<BYTE>(std::max(0, std::min(255, scaled + 128)));
+        }
+    }
+
+    return true;
+}
+
+struct WallSoundPlaybackRequest {
+    std::string path;
+    int volumePercent = 100;
+};
+
+DWORD WINAPI wallSoundPlaybackThread(LPVOID parameter) {
+    std::unique_ptr<WallSoundPlaybackRequest> request(static_cast<WallSoundPlaybackRequest*>(parameter));
+    if (request == nullptr) {
+        return 0;
+    }
+
+    WAVEFORMATEX format = {};
+    std::vector<BYTE> audioData;
+    if (!loadPcmWaveFile(request->path, request->volumePercent, format, audioData)) {
+        if (g_runtimeProbeLogger != nullptr && g_wallSoundLogCount < 8) {
+            InterlockedIncrement(&g_wallSoundLogCount);
+            g_runtimeProbeLogger->warn("wall sound WAV load failed: " + request->path);
+        }
+        return 0;
+    }
+
+    HWAVEOUT waveOut = nullptr;
+    MMRESULT result = waveOutOpen(&waveOut, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
+    if (result != MMSYSERR_NOERROR || waveOut == nullptr) {
+        if (g_runtimeProbeLogger != nullptr && g_wallSoundLogCount < 8) {
+            InterlockedIncrement(&g_wallSoundLogCount);
+            g_runtimeProbeLogger->warn("wall sound waveOutOpen failed: " + request->path);
+        }
+        return 0;
+    }
+
+    WAVEHDR header = {};
+    header.lpData = reinterpret_cast<LPSTR>(audioData.data());
+    header.dwBufferLength = static_cast<DWORD>(audioData.size());
+    result = waveOutPrepareHeader(waveOut, &header, sizeof(header));
+    if (result == MMSYSERR_NOERROR) {
+        result = waveOutWrite(waveOut, &header, sizeof(header));
+    }
+
+    if (result != MMSYSERR_NOERROR) {
+        if (header.dwFlags & WHDR_PREPARED) {
+            waveOutUnprepareHeader(waveOut, &header, sizeof(header));
+        }
+        waveOutClose(waveOut);
+        if (g_runtimeProbeLogger != nullptr && g_wallSoundLogCount < 8) {
+            InterlockedIncrement(&g_wallSoundLogCount);
+            g_runtimeProbeLogger->warn("wall sound waveOutWrite failed: " + request->path);
+        }
+        return 0;
+    }
+
+    while ((header.dwFlags & WHDR_DONE) == 0) {
+        Sleep(5);
+    }
+
+    waveOutUnprepareHeader(waveOut, &header, sizeof(header));
+    waveOutClose(waveOut);
+
+    if (g_runtimeProbeLogger != nullptr && g_wallSoundLogCount < 8) {
+        InterlockedIncrement(&g_wallSoundLogCount);
+        g_runtimeProbeLogger->info("wall sound playback started: " + request->path);
+    }
+    return 0;
+}
+
+void playWallSoundPath(const std::string& path) {
+    if (!g_soundConfig.enabled || path.empty() || g_soundConfig.volumePercent <= 0) {
+        return;
+    }
+
+    if (!wallSoundFileExists(path)) {
+        if (g_runtimeProbeLogger != nullptr && g_wallSoundMissingLogCount < 8) {
+            InterlockedIncrement(&g_wallSoundMissingLogCount);
+            g_runtimeProbeLogger->warn("wall sound file not found: " + path);
+        }
+        return;
+    }
+
+    auto request = std::make_unique<WallSoundPlaybackRequest>();
+    request->path = path;
+    request->volumePercent = g_soundConfig.volumePercent;
+    HANDLE thread = CreateThread(nullptr, 0, wallSoundPlaybackThread, request.get(), 0, nullptr);
+    if (thread == nullptr) {
+        if (g_runtimeProbeLogger != nullptr && g_wallSoundLogCount < 8) {
+            InterlockedIncrement(&g_wallSoundLogCount);
+            g_runtimeProbeLogger->warn("wall sound playback thread creation failed: " + path);
+        }
+        return;
+    }
+
+    request.release();
+    CloseHandle(thread);
+}
+
+void playWallTouchedSoundForCount(std::size_t touchedCount, std::size_t totalWallCount) {
+    if (!g_soundConfig.enabled || touchedCount == 0) {
+        return;
+    }
+
+    if (totalWallCount > 0 && touchedCount == totalWallCount) {
+        playWallSoundPath(g_soundConfig.allWallsTouchedSoundPath);
+        return;
+    }
+
+    if (touchedCount <= g_soundConfig.wallTouchedSoundPaths.size()) {
+        playWallSoundPath(g_soundConfig.wallTouchedSoundPaths[touchedCount - 1]);
+    } else {
+        playWallSoundPath(g_soundConfig.wallTouchedExtraSoundPath);
+    }
+}
+
 void rememberWaStateUiAddress(std::uintptr_t stateUiAddress) {
     if (stateUiAddress == 0
         || !isReadableMemoryRange(stateUiAddress + kWaCurrentTeamByteOffset, sizeof(BYTE))) {
@@ -1578,6 +1842,9 @@ bool markTouchedOverlayWallFromPhysics(
         }
 
         rect.touched = true;
+        const std::size_t touchedCount = touchedOverlayWallCount();
+        const std::size_t totalWallCount = g_direct3D9OverlayTestRects.size();
+        playWallTouchedSoundForCount(touchedCount, totalWallCount);
         InterlockedExchange(&g_wallTouchLastTouchTick, static_cast<LONG>(now));
         if (ownerAddress != 0) {
             InterlockedCompareExchange(
@@ -1749,6 +2016,9 @@ void resetWormLiveSampleTransientHistory(WormLiveSample& sample) {
 void resetTransientGameplayTrackingState(const char* reason, bool clearWormSamples) {
     const std::size_t resetWallCount = resetTouchedOverlayWallsForNewTurn();
     resetCollisionDiagnosticLogWindows();
+    InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, static_cast<LONG>(GetTickCount() + 450));
     if (resetWallCount != 0) {
         InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(GetTickCount()));
     }
@@ -5869,6 +6139,206 @@ bool getDirect3D9RenderTargetSize(IDirect3DDevice9* device, UINT& width, UINT& h
     return width > 0 && height > 0;
 }
 
+bool isBrightChatSeparatorPixel(const BYTE* pixel, D3DFORMAT format) {
+    int red = 0;
+    int green = 0;
+    int blue = 0;
+
+    if (format == D3DFMT_X8R8G8B8 || format == D3DFMT_A8R8G8B8) {
+        blue = pixel[0];
+        green = pixel[1];
+        red = pixel[2];
+    } else if (format == D3DFMT_R5G6B5) {
+        const std::uint16_t value = static_cast<std::uint16_t>(pixel[0])
+            | (static_cast<std::uint16_t>(pixel[1]) << 8);
+        red = ((value >> 11) & 0x1F) * 255 / 31;
+        green = ((value >> 5) & 0x3F) * 255 / 63;
+        blue = (value & 0x1F) * 255 / 31;
+    } else if (format == D3DFMT_X1R5G5B5) {
+        const std::uint16_t value = static_cast<std::uint16_t>(pixel[0])
+            | (static_cast<std::uint16_t>(pixel[1]) << 8);
+        red = ((value >> 10) & 0x1F) * 255 / 31;
+        green = ((value >> 5) & 0x1F) * 255 / 31;
+        blue = (value & 0x1F) * 255 / 31;
+    } else {
+        return false;
+    }
+
+    return red >= 170 && green >= 170 && blue >= 170 && std::abs(red - green) <= 45 && std::abs(red - blue) <= 45;
+}
+
+int bytesPerPixelForDirect3D9Format(D3DFORMAT format) {
+    if (format == D3DFMT_X8R8G8B8 || format == D3DFMT_A8R8G8B8) {
+        return 4;
+    }
+
+    if (format == D3DFMT_R5G6B5 || format == D3DFMT_X1R5G5B5) {
+        return 2;
+    }
+
+    return 0;
+}
+
+bool detectDirect3D9ChatOffsetFromRenderTarget(IDirect3DDevice9* device, bool pinnedOnly, int& offsetY) {
+    offsetY = 0;
+    if (device == nullptr) {
+        return false;
+    }
+
+    IDirect3DSurface9* renderTarget = nullptr;
+    HRESULT result = device->GetRenderTarget(0, &renderTarget);
+    if (FAILED(result) || renderTarget == nullptr) {
+        return false;
+    }
+
+    D3DSURFACE_DESC description = {};
+    result = renderTarget->GetDesc(&description);
+    if (FAILED(result) || description.Width < 64 || description.Height < 64) {
+        renderTarget->Release();
+        return false;
+    }
+
+    const int bytesPerPixel = bytesPerPixelForDirect3D9Format(description.Format);
+    if (bytesPerPixel == 0) {
+        renderTarget->Release();
+        return false;
+    }
+
+    IDirect3DSurface9* systemSurface = nullptr;
+    result = device->CreateOffscreenPlainSurface(
+        description.Width,
+        description.Height,
+        description.Format,
+        D3DPOOL_SYSTEMMEM,
+        &systemSurface,
+        nullptr);
+    if (FAILED(result) || systemSurface == nullptr) {
+        renderTarget->Release();
+        return false;
+    }
+
+    result = device->GetRenderTargetData(renderTarget, systemSurface);
+    renderTarget->Release();
+    if (FAILED(result)) {
+        systemSurface->Release();
+        return false;
+    }
+
+    D3DLOCKED_RECT locked = {};
+    result = systemSurface->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+    if (FAILED(result)) {
+        systemSurface->Release();
+        return false;
+    }
+
+    const int width = static_cast<int>(description.Width);
+    const int height = static_cast<int>(description.Height);
+    const int startX = width / 16;
+    const int endX = width - startX;
+    const int samples = std::max(1, (endX - startX + 3) / 4);
+    int bestY = -1;
+    int bestScore = 0;
+    const int minimumScore = std::max(20, samples / 3);
+
+    auto findChatSeparator = [&](int scanStartY, int scanEndY) {
+        bestY = -1;
+        bestScore = 0;
+
+        const int clampedStartY = std::max(0, std::min(scanStartY, height - 1));
+        const int clampedEndY = std::max(clampedStartY + 1, std::min(scanEndY, height));
+        for (int y = clampedStartY; y < clampedEndY; ++y) {
+            const BYTE* row = static_cast<const BYTE*>(locked.pBits) + (static_cast<std::ptrdiff_t>(locked.Pitch) * y);
+            int score = 0;
+            for (int x = startX; x < endX; x += 4) {
+                const BYTE* pixel = row + (static_cast<std::ptrdiff_t>(x) * bytesPerPixel);
+                if (isBrightChatSeparatorPixel(pixel, description.Format)) {
+                    ++score;
+                }
+            }
+
+            if (score >= minimumScore && (score > bestScore || (score == bestScore && y > bestY))) {
+                bestScore = score;
+                bestY = y;
+            }
+        }
+
+        return bestY >= 0 && bestScore >= minimumScore;
+    };
+
+    bool pinnedChatBar = false;
+    if (pinnedOnly) {
+        const int endY = std::min(height - 1, std::max(96, (height * 62) / 100));
+        pinnedChatBar = findChatSeparator(4, endY);
+    } else if (findChatSeparator(4, std::min(height / 8, 96)) && bestY <= 72) {
+        pinnedChatBar = true;
+    } else {
+        const int startY = std::max(8, height / 20);
+        const int endY = std::min(height / 2, std::max(startY + 1, (height * 45) / 100));
+        findChatSeparator(startY, endY);
+    }
+
+    systemSurface->UnlockRect();
+    systemSurface->Release();
+
+    if (bestY < 0 || bestScore < minimumScore) {
+        return false;
+    }
+
+    offsetY = std::max(0, bestY / 2);
+    if (offsetY > height / 3) {
+        offsetY = height / 3;
+    }
+
+    if (g_runtimeProbeLogger != nullptr && g_chatOverlayScanLogCount < 16) {
+        InterlockedIncrement(&g_chatOverlayScanLogCount);
+        std::ostringstream message;
+        message << "runtime: D3D9 chat separator detected at y "
+                << bestY
+                << (pinnedChatBar ? " (pinned)" : "")
+                << ", score "
+                << bestScore
+                << "/"
+                << samples
+                << ", offset "
+                << offsetY;
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return true;
+}
+
+void resetChatOverlayScanSamples() {
+    InterlockedExchange(&g_chatOverlayScanSampleCount, 0);
+    for (LONG& sample : g_chatOverlayScanSamples) {
+        sample = 0;
+    }
+}
+
+void finalizeChatOverlayDetectedOffsetFromSamples() {
+    const LONG sampleCount = g_chatOverlayScanSampleCount;
+    const LONG count = std::min<LONG>(sampleCount, static_cast<LONG>(g_chatOverlayScanSamples.size()));
+    if (count <= 0) {
+        return;
+    }
+
+    std::array<LONG, 5> sorted = g_chatOverlayScanSamples;
+    std::sort(sorted.begin(), sorted.begin() + count);
+    const LONG median = sorted[static_cast<std::size_t>(count / 2)];
+    InterlockedExchange(&g_chatOverlayDetectedOffsetY, median);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 1);
+
+    if (g_runtimeProbeLogger != nullptr && g_chatOverlayScanLogCount < 16) {
+        InterlockedIncrement(&g_chatOverlayScanLogCount);
+        std::ostringstream message;
+        message << "runtime: D3D9 chat separator stable offset "
+                << median
+                << " from "
+                << count
+                << " sample(s)";
+        g_runtimeProbeLogger->info(message.str());
+    }
+}
+
 Direct3D9OverlayRect makeDirect3D9OverlayRect(const WaOverlayRect& rect) {
     return Direct3D9OverlayRect{
         rect.left,
@@ -6767,7 +7237,11 @@ bool prepareMetadataOverlayScreenRects(
     const char* rendererName,
     UINT renderTargetWidth,
     UINT renderTargetHeight,
-    std::vector<ScreenOverlayRect>& screenRects) {
+    std::vector<ScreenOverlayRect>& screenRects,
+    int viewportX = 0,
+    int viewportY = 0,
+    UINT viewportWidth = 0,
+    UINT viewportHeight = 0) {
     screenRects.clear();
 
     syncDirect3D9OverlayMapFromDetectedFile();
@@ -6785,6 +7259,16 @@ bool prepareMetadataOverlayScreenRects(
         return false;
     }
 
+    activatePendingChatOverlayPinnedModeIfReady();
+
+    if (viewportWidth == 0) {
+        viewportWidth = renderTargetWidth;
+    }
+
+    if (viewportHeight == 0) {
+        viewportHeight = renderTargetHeight;
+    }
+
     updateTouchedOverlayWallsFromActiveWorm();
 
     int baseX = metadataOverlayBaseX(renderTargetWidth);
@@ -6797,13 +7281,94 @@ bool prepareMetadataOverlayScreenRects(
     }
 
     if (g_direct3D9OverlayTransform.cameraFollow && camera.available) {
-        baseX = (static_cast<int>(renderTargetWidth) / 2)
+        baseX = viewportX
+            + (static_cast<int>(viewportWidth) / 2)
             - camera.xPixels
             + g_direct3D9OverlayTransform.offsetX;
-        baseY = (static_cast<int>(renderTargetHeight) / 2)
+        baseY = viewportY
+            + (static_cast<int>(viewportHeight) / 2)
             - camera.yPixels
             + g_direct3D9OverlayTransform.offsetY;
+
+        if (g_chatOverlayPinnedMode != 0) {
+            LONG pinnedBaseOffsetY = g_chatOverlayPinnedCameraOffsetY;
+            if (pinnedBaseOffsetY == LONG_MIN) {
+                LONG pinnedBaselineBaseY = g_chatOverlayPinnedBaselineBaseY;
+                if (pinnedBaselineBaseY == LONG_MIN) {
+                    InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, static_cast<LONG>(baseY));
+                    pinnedBaselineBaseY = static_cast<LONG>(baseY);
+                }
+
+                const LONG lastUnpinnedBaseY = g_chatOverlayLastUnpinnedBaseY;
+                const LONG candidateOffsetY = lastUnpinnedBaseY != LONG_MIN
+                    ? lastUnpinnedBaseY - static_cast<LONG>(baseY)
+                    : 0;
+                pinnedBaseOffsetY = (std::abs(candidateOffsetY) <= 96) ? candidateOffsetY : 0;
+                if (pinnedBaseOffsetY == 0) {
+                    pinnedBaseOffsetY = std::max<LONG>(1, static_cast<LONG>((renderTargetHeight + 28) / 57));
+                }
+                const LONG baseDriftY = pinnedBaselineBaseY - static_cast<LONG>(baseY);
+                pinnedBaseOffsetY += std::max<LONG>(-256, std::min<LONG>(256, baseDriftY));
+                InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, pinnedBaseOffsetY);
+
+                if (g_runtimeProbeLogger != nullptr && g_chatOverlayHiddenLogCount < 8) {
+                    InterlockedIncrement(&g_chatOverlayHiddenLogCount);
+                    std::ostringstream message;
+                    message << "runtime: metadata overlay pinned base offset "
+                            << pinnedBaseOffsetY
+                            << " px from base y "
+                            << baseY
+                            << " baseline base y "
+                            << pinnedBaselineBaseY;
+                    g_runtimeProbeLogger->info(message.str());
+                }
+            }
+
+            baseY += static_cast<int>(pinnedBaseOffsetY);
+        } else {
+            if (g_chatOverlayActive == 0 && g_chatOverlayPinnedPending == 0) {
+                InterlockedExchange(&g_chatOverlayLastUnpinnedCameraYPixels, static_cast<LONG>(camera.yPixels));
+                InterlockedExchange(&g_chatOverlayLastUnpinnedBaseY, static_cast<LONG>(baseY));
+            }
+            InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+        }
     }
+
+    const bool viewportMovedForChat =
+        viewportX != 0
+        || viewportY != 0
+        || viewportWidth != renderTargetWidth
+        || viewportHeight != renderTargetHeight;
+    if (g_chatOverlayActive != 0 && g_chatOverlayPinnedMode == 0 && !viewportMovedForChat) {
+        const bool detectedChatOffset = g_chatOverlayDetectedOffsetValid != 0;
+        if (detectedChatOffset) {
+            const int chatOffsetY = static_cast<int>(g_chatOverlayDetectedOffsetY);
+            baseY += chatOffsetY;
+            const LONG hits = InterlockedIncrement(&g_chatOverlayHiddenLogCount);
+            if (hits <= 4 && g_runtimeProbeLogger != nullptr) {
+                std::ostringstream message;
+                message << "runtime: metadata overlay shifted by detected chat offset "
+                        << chatOffsetY
+                        << " px";
+                g_runtimeProbeLogger->info(message.str());
+            }
+        }
+    } else if (g_chatOverlayActive != 0 && viewportMovedForChat) {
+        const LONG hits = InterlockedIncrement(&g_chatOverlayHiddenLogCount);
+        if (hits <= 4 && g_runtimeProbeLogger != nullptr) {
+            std::ostringstream message;
+            message << "runtime: metadata overlay using renderer viewport for chat: origin "
+                    << viewportX
+                    << ","
+                    << viewportY
+                    << " size "
+                    << viewportWidth
+                    << "x"
+                    << viewportHeight;
+            g_runtimeProbeLogger->info(message.str());
+        }
+    }
+
     logMetadataOverlayTransform(
         rendererName != nullptr ? rendererName : "renderer",
         renderTargetWidth,
@@ -6837,8 +7402,84 @@ void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
         return;
     }
 
+    const LONG pinnedAutoProbeTick = g_chatOverlayPinnedAutoProbeTick;
+    if (pinnedAutoProbeTick != 0
+        && g_chatOverlayActive == 0
+        && g_chatOverlayPinnedMode == 0
+        && g_chatOverlayPinnedPending == 0) {
+        const DWORD now = GetTickCount();
+        if (static_cast<LONG>(now - static_cast<DWORD>(pinnedAutoProbeTick)) >= 0
+            && InterlockedCompareExchange(&g_chatOverlayPinnedAutoProbeTick, 0, pinnedAutoProbeTick) == pinnedAutoProbeTick) {
+            int ignoredPinnedOffsetY = 0;
+            if (detectDirect3D9ChatOffsetFromRenderTarget(device, true, ignoredPinnedOffsetY)) {
+                activateChatOverlayPinnedMode();
+                InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+                if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+                    InterlockedIncrement(&g_chatInputLogCount);
+                    g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned mode auto-detected from render target");
+                }
+            }
+        }
+    }
+
+    const LONG pendingScanTick = g_chatOverlayScanPendingTick;
+    if (g_chatOverlayActive != 0 && g_chatOverlayPinnedMode == 0 && pendingScanTick != 0) {
+        const DWORD now = GetTickCount();
+        if (static_cast<LONG>(now - static_cast<DWORD>(pendingScanTick)) >= 0
+            && InterlockedCompareExchange(&g_chatOverlayScanPendingTick, 0, pendingScanTick) == pendingScanTick) {
+            int detectedOffsetY = 0;
+            if (detectDirect3D9ChatOffsetFromRenderTarget(device, false, detectedOffsetY)) {
+                const LONG sampleIndex = InterlockedIncrement(&g_chatOverlayScanSampleCount) - 1;
+                if (sampleIndex >= 0 && sampleIndex < static_cast<LONG>(g_chatOverlayScanSamples.size())) {
+                    g_chatOverlayScanSamples[static_cast<std::size_t>(sampleIndex)] = detectedOffsetY;
+                }
+
+                constexpr LONG kChatOverlayScanTargetSamples = 5;
+                if (sampleIndex + 1 >= kChatOverlayScanTargetSamples) {
+                    finalizeChatOverlayDetectedOffsetFromSamples();
+                } else {
+                    InterlockedExchange(&g_chatOverlayScanPendingTick, static_cast<LONG>(GetTickCount() + 80));
+                }
+            } else {
+                const LONG currentSampleCount = g_chatOverlayScanSampleCount;
+                if (currentSampleCount > 0) {
+                    finalizeChatOverlayDetectedOffsetFromSamples();
+                } else {
+                    InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 0);
+                }
+
+                if (currentSampleCount == 0 && g_runtimeProbeLogger != nullptr && g_chatOverlayScanLogCount < 16) {
+                    InterlockedIncrement(&g_chatOverlayScanLogCount);
+                    g_runtimeProbeLogger->info("runtime: D3D9 chat separator scan found no reliable separator; chat overlay offset disabled");
+                }
+            }
+        }
+    }
+
+    D3DVIEWPORT9 viewport = {};
+    int viewportX = 0;
+    int viewportY = 0;
+    UINT viewportWidth = renderTargetWidth;
+    UINT viewportHeight = renderTargetHeight;
+    if (SUCCEEDED(device->GetViewport(&viewport))
+        && viewport.Width > 0
+        && viewport.Height > 0) {
+        viewportX = static_cast<int>(viewport.X);
+        viewportY = static_cast<int>(viewport.Y);
+        viewportWidth = viewport.Width;
+        viewportHeight = viewport.Height;
+    }
+
     std::vector<ScreenOverlayRect> screenRects;
-    if (!prepareMetadataOverlayScreenRects("Direct3D9", renderTargetWidth, renderTargetHeight, screenRects)) {
+    if (!prepareMetadataOverlayScreenRects(
+            "Direct3D9",
+            renderTargetWidth,
+            renderTargetHeight,
+            screenRects,
+            viewportX,
+            viewportY,
+            viewportWidth,
+            viewportHeight)) {
         return;
     }
 
@@ -8370,6 +9011,260 @@ void startRendererModuleProbe(Logger& logger) {
     logger.info("runtime probe: renderer module sampler started");
 }
 
+bool controlKeyDown() {
+    return g_chatOverlayControlKeyActive != 0
+        || (GetKeyState(VK_CONTROL) & 0x8000) != 0
+        || (GetKeyState(VK_LCONTROL) & 0x8000) != 0
+        || (GetKeyState(VK_RCONTROL) & 0x8000) != 0;
+}
+
+void scheduleChatOverlayScan(DWORD delayMilliseconds) {
+    InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetY, 0);
+    resetChatOverlayScanSamples();
+    InterlockedExchange(&g_chatOverlayScanPendingTick, static_cast<LONG>(GetTickCount() + delayMilliseconds));
+}
+
+void activateChatOverlayPinnedMode() {
+    InterlockedExchange(&g_chatOverlayActive, 1);
+    InterlockedExchange(&g_chatOverlayPinnedMode, 1);
+    InterlockedExchange(&g_chatOverlayPinnedPending, 0);
+    InterlockedExchange(&g_chatOverlayPinnedActivationTick, 0);
+    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
+    InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayLastUnpinnedBaseY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayScanPendingTick, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetY, 0);
+    resetChatOverlayScanSamples();
+}
+
+void scheduleChatOverlayPinnedActivation(DWORD delayMilliseconds) {
+    InterlockedExchange(&g_chatOverlayActive, 0);
+    InterlockedExchange(&g_chatOverlayPinnedMode, 0);
+    InterlockedExchange(&g_chatOverlayPinnedPending, 1);
+    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
+    InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayLastUnpinnedBaseY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayScanPendingTick, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetY, 0);
+    resetChatOverlayScanSamples();
+    InterlockedExchange(&g_chatOverlayPinnedActivationTick, static_cast<LONG>(GetTickCount() + delayMilliseconds));
+}
+
+void activatePendingChatOverlayPinnedModeIfReady() {
+    const LONG pendingTick = g_chatOverlayPinnedActivationTick;
+    if (g_chatOverlayPinnedPending == 0 || pendingTick == 0) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if (static_cast<LONG>(now - static_cast<DWORD>(pendingTick)) < 0) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_chatOverlayPinnedActivationTick, 0, pendingTick) == pendingTick) {
+        activateChatOverlayPinnedMode();
+        if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+            InterlockedIncrement(&g_chatInputLogCount);
+            g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned mode enabled after deferred close");
+        }
+    }
+}
+
+void resetChatOverlayState() {
+    InterlockedExchange(&g_chatOverlayActive, 0);
+    InterlockedExchange(&g_chatOverlayPinnedMode, 0);
+    InterlockedExchange(&g_chatOverlayPinnedPending, 0);
+    InterlockedExchange(&g_chatOverlayPinnedActivationTick, 0);
+    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
+    InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayScanPendingTick, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetY, 0);
+    resetChatOverlayScanSamples();
+}
+
+void updateChatOverlayStateFromWindowMessage(const MSG& message) {
+    const UINT msg = message.message;
+    if (msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN && msg != WM_KEYUP && msg != WM_SYSKEYUP) {
+        return;
+    }
+
+    const WPARAM key = message.wParam;
+    if (key == VK_CONTROL || key == VK_LCONTROL || key == VK_RCONTROL) {
+        const bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        InterlockedExchange(&g_chatOverlayControlKeyActive, down ? 1 : 0);
+        return;
+    }
+
+    if (msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN) {
+        return;
+    }
+
+    const bool ctrl = controlKeyDown();
+    if (ctrl && key == VK_NEXT) {
+        if (g_chatOverlayActive != 0 && g_chatOverlayPinnedMode == 0) {
+            InterlockedExchange(&g_chatOverlayPinnedPending, 1);
+            if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+                InterlockedIncrement(&g_chatInputLogCount);
+                g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned mode pending until normal chat closes");
+            }
+            return;
+        }
+
+        activateChatOverlayPinnedMode();
+        if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+            InterlockedIncrement(&g_chatInputLogCount);
+            g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned mode enabled from Ctrl+PageDown");
+        }
+        return;
+    }
+
+    if (ctrl && key == VK_PRIOR) {
+        if (g_chatOverlayPinnedMode == 0) {
+            if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+                InterlockedIncrement(&g_chatInputLogCount);
+                g_runtimeProbeLogger->info("runtime: W:A chat overlay ignored Ctrl+PageUp outside pinned mode");
+            }
+            return;
+        }
+
+        const LONG previous = g_chatOverlayActive;
+        resetChatOverlayState();
+        if (previous != 0 && g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+            InterlockedIncrement(&g_chatInputLogCount);
+            g_runtimeProbeLogger->info("runtime: W:A chat overlay suppression disabled from Ctrl+PageUp unpin");
+        }
+        return;
+    }
+
+    const bool plainArrow =
+        !ctrl
+        && (key == VK_UP || key == VK_DOWN || key == VK_LEFT || key == VK_RIGHT);
+    if (g_chatOverlayActive != 0 && plainArrow) {
+        if (g_chatOverlayPinnedMode != 0) {
+            if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+                InterlockedIncrement(&g_chatInputLogCount);
+                g_runtimeProbeLogger->info("runtime: W:A chat overlay ignored arrow key while pinned");
+            }
+            return;
+        }
+
+        if (g_chatOverlayPinnedPending != 0) {
+            scheduleChatOverlayPinnedActivation(260);
+            if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+                InterlockedIncrement(&g_chatInputLogCount);
+                g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned mode deferred after arrow key closed normal chat");
+            }
+            return;
+        }
+
+        const LONG previous = g_chatOverlayActive;
+        resetChatOverlayState();
+        if (previous != 0 && g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+            InterlockedIncrement(&g_chatInputLogCount);
+            g_runtimeProbeLogger->info("runtime: W:A chat overlay suppression disabled from arrow key");
+        }
+        return;
+    }
+
+    if (g_chatOverlayActive != 0
+        && ctrl
+        && (key == VK_UP || key == VK_DOWN)) {
+        if (g_chatOverlayPinnedMode != 0) {
+            InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+            if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+                InterlockedIncrement(&g_chatInputLogCount);
+                std::ostringstream logMessage;
+                logMessage << "runtime: W:A chat overlay pinned resize base recalculation from Ctrl+"
+                           << (key == VK_UP ? "Up" : "Down");
+                g_runtimeProbeLogger->info(logMessage.str());
+            }
+            return;
+        }
+
+        scheduleChatOverlayScan(220);
+        if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+            InterlockedIncrement(&g_chatInputLogCount);
+            std::ostringstream logMessage;
+            logMessage << "runtime: W:A chat overlay rescan scheduled from Ctrl+"
+                       << (key == VK_UP ? "Up" : "Down");
+            g_runtimeProbeLogger->info(logMessage.str());
+        }
+        return;
+    }
+
+    if (key != VK_NEXT && key != VK_PRIOR) {
+        return;
+    }
+
+    if (key == VK_PRIOR && g_chatOverlayPinnedMode != 0) {
+        if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+            InterlockedIncrement(&g_chatInputLogCount);
+            g_runtimeProbeLogger->info("runtime: W:A chat overlay ignored PageUp while pinned");
+        }
+        return;
+    }
+
+    if (key == VK_PRIOR && g_chatOverlayPinnedPending != 0) {
+        scheduleChatOverlayPinnedActivation(260);
+        if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+            InterlockedIncrement(&g_chatInputLogCount);
+            g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned mode deferred after PageUp closed normal chat");
+        }
+        return;
+    }
+
+    LONG previous = 0;
+    LONG newValue = 0;
+    if (key == VK_NEXT) {
+        if (g_chatOverlayPinnedMode != 0) {
+            InterlockedExchange(&g_chatOverlayPinnedMode, 0);
+            InterlockedExchange(&g_chatOverlayPinnedPending, 1);
+            InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+            InterlockedExchange(&g_chatOverlayActive, 1);
+            scheduleChatOverlayScan(220);
+            if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+                InterlockedIncrement(&g_chatInputLogCount);
+                g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned chat expanded from PageDown");
+            }
+            return;
+        }
+
+        previous = InterlockedCompareExchange(&g_chatOverlayActive, 1, 0);
+        if (previous != 0) {
+            if (g_chatOverlayPinnedMode == 0) {
+                scheduleChatOverlayScan(220);
+            }
+            return;
+        }
+
+        InterlockedExchange(&g_chatOverlayPinnedMode, 0);
+        InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+        newValue = 1;
+        scheduleChatOverlayScan(220);
+    } else {
+        newValue = 0;
+        previous = g_chatOverlayActive;
+        resetChatOverlayState();
+    }
+
+    if (previous != newValue && g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
+        InterlockedIncrement(&g_chatInputLogCount);
+        std::ostringstream logMessage;
+        logMessage << "runtime: W:A chat overlay suppression "
+                   << (newValue != 0 ? "enabled" : "disabled")
+                   << " from "
+                   << (key == VK_NEXT ? "PageDown" : "PageUp");
+        g_runtimeProbeLogger->info(logMessage.str());
+    }
+}
+
 BOOL WINAPI hookedGetMessageA(LPMSG message, HWND window, UINT messageFilterMin, UINT messageFilterMax) {
     const LONG hits = InterlockedIncrement(&g_getMessageProbeHits);
     if (hits == 1 && g_runtimeProbeLogger != nullptr) {
@@ -8381,7 +9276,31 @@ BOOL WINAPI hookedGetMessageA(LPMSG message, HWND window, UINT messageFilterMin,
         return -1;
     }
 
-    return g_originalGetMessageA(message, window, messageFilterMin, messageFilterMax);
+    const BOOL result = g_originalGetMessageA(message, window, messageFilterMin, messageFilterMax);
+    if (result > 0 && message != nullptr) {
+        updateChatOverlayStateFromWindowMessage(*message);
+    }
+
+    return result;
+}
+
+BOOL WINAPI hookedPeekMessageA(LPMSG message, HWND window, UINT messageFilterMin, UINT messageFilterMax, UINT removeMessage) {
+    const LONG hits = InterlockedIncrement(&g_peekMessageProbeHits);
+    if (hits == 1 && g_runtimeProbeLogger != nullptr) {
+        g_runtimeProbeLogger->info("runtime probe: USER32!PeekMessageA IAT hook fired");
+    }
+
+    if (g_originalPeekMessageA == nullptr) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+
+    const BOOL result = g_originalPeekMessageA(message, window, messageFilterMin, messageFilterMax, removeMessage);
+    if (result && message != nullptr) {
+        updateChatOverlayStateFromWindowMessage(*message);
+    }
+
+    return result;
 }
 
 HANDLE WINAPI hookedCreateFileA(
@@ -9016,6 +9935,7 @@ bool WaHookManager::initialize(
     const std::vector<WaOverlayRect>& direct3D9OverlayTestRects,
     const std::vector<WaOverlayMap>& direct3D9OverlayMaps,
     const WaOverlayTransform& direct3D9OverlayTransform,
+    const WaSoundConfig& soundConfig,
     std::string& error) {
     error.clear();
 
@@ -9093,6 +10013,7 @@ bool WaHookManager::initialize(
     g_direct3D9DeviceSlotProbeEnabled = enableDirect3D9DeviceSlotProbe;
     g_direct3D9OverlaySmokeTestEnabled = enableDirect3D9OverlaySmokeTest;
     g_direct3D9OverlayTransform = direct3D9OverlayTransform;
+    g_soundConfig = soundConfig;
     g_direct3D9OverlayMaps = direct3D9OverlayMaps;
     g_detectedMapCachePath = direct3D9OverlayTransform.mapCachePath;
     g_customDatPath = direct3D9OverlayTransform.customDatPath;
@@ -9116,6 +10037,26 @@ bool WaHookManager::initialize(
         });
     }
     InterlockedExchange(&g_getMessageProbeHits, 0);
+    InterlockedExchange(&g_peekMessageProbeHits, 0);
+    InterlockedExchange(&g_wallSoundLogCount, 0);
+    InterlockedExchange(&g_wallSoundMissingLogCount, 0);
+    InterlockedExchange(&g_chatOverlayActive, 0);
+    InterlockedExchange(&g_chatOverlayHiddenLogCount, 0);
+    InterlockedExchange(&g_chatInputLogCount, 0);
+    InterlockedExchange(&g_chatOverlayScanPendingTick, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetY, 0);
+    InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 0);
+    InterlockedExchange(&g_chatOverlayScanLogCount, 0);
+    InterlockedExchange(&g_chatOverlayControlKeyActive, 0);
+    InterlockedExchange(&g_chatOverlayPinnedMode, 0);
+    InterlockedExchange(&g_chatOverlayPinnedPending, 0);
+    InterlockedExchange(&g_chatOverlayPinnedActivationTick, 0);
+    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
+    InterlockedExchange(&g_chatOverlayLastUnpinnedCameraYPixels, 0);
+    InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
+    InterlockedExchange(&g_chatOverlayLastUnpinnedBaseY, LONG_MIN);
+    resetChatOverlayScanSamples();
     InterlockedExchange(&g_cameraTrackingProbeHits, 0);
     InterlockedExchange(&g_cameraTrackingPointAddress, 0);
     InterlockedExchange(&g_cameraTrackingXFixed, 0);
@@ -9307,21 +10248,39 @@ bool WaHookManager::initialize(
         }
     }
 
-    if (enableMessagePumpProbe) {
+    if (enableMessagePumpProbe || enableMetadataOverlayHooks) {
         void* originalGetMessageA = nullptr;
         if (!getMessageHook_.install("USER32.dll", "GetMessageA", reinterpret_cast<void*>(&hookedGetMessageA), originalGetMessageA, error)) {
-            g_runtimeProbeLogger = nullptr;
             logger.warn("runtime probe: failed to install USER32!GetMessageA IAT hook: " + error);
-            return false;
+        } else {
+            g_originalGetMessageA = reinterpret_cast<GetMessageAFunction>(originalGetMessageA);
+
+            std::ostringstream hookMessage;
+            hookMessage << "runtime probe: USER32!GetMessageA IAT hook installed; original "
+                        << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalGetMessageA))
+                        << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedGetMessageA));
+            logger.info(hookMessage.str());
         }
 
-        g_originalGetMessageA = reinterpret_cast<GetMessageAFunction>(originalGetMessageA);
+        void* originalPeekMessageA = nullptr;
+        if (!peekMessageHook_.install("USER32.dll", "PeekMessageA", reinterpret_cast<void*>(&hookedPeekMessageA), originalPeekMessageA, error)) {
+            logger.warn("runtime probe: failed to install USER32!PeekMessageA IAT hook: " + error);
+        } else {
+            g_originalPeekMessageA = reinterpret_cast<PeekMessageAFunction>(originalPeekMessageA);
 
-        std::ostringstream hookMessage;
-        hookMessage << "runtime probe: USER32!GetMessageA IAT hook installed; original "
-                    << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalGetMessageA))
-                    << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedGetMessageA));
-        logger.info(hookMessage.str());
+            std::ostringstream hookMessage;
+            hookMessage << "runtime probe: USER32!PeekMessageA IAT hook installed; original "
+                        << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalPeekMessageA))
+                        << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedPeekMessageA));
+            logger.info(hookMessage.str());
+        }
+
+        if (!getMessageHook_.installed() && !peekMessageHook_.installed()) {
+            g_runtimeProbeLogger = nullptr;
+            error = "failed to install every USER32 message runtime probe hook";
+            logger.warn("runtime probe: " + error);
+            return false;
+        }
     }
 
     if (enableRendererApiProbe) {

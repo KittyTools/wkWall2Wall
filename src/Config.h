@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string>
 
 struct Config {
@@ -32,6 +33,11 @@ struct Config {
     int direct3D9MetadataOverlayScalePercent = 100;
     std::string wallMetadataDirectory = "User\\Walls";
     int touchRadiusPixels = 8;
+    bool enableSounds = true;
+    int soundVolumePercent = 100;
+    std::array<std::string, 5> wallTouchedSoundPaths;
+    std::string wallTouchedExtraSoundPath = "User\\Walls\\Sounds\\wall_touch_x.wav";
+    std::string allWallsTouchedSoundPath = "User\\Walls\\Sounds\\all_walls_touched.wav";
 
     static Config load(const std::string& gameDirectory);
 };

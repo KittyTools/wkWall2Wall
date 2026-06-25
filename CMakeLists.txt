@@ -24,7 +24,7 @@ add_library(wkWall2Wall SHARED
 
 target_compile_features(wkWall2Wall PRIVATE cxx_std_20)
 target_compile_definitions(wkWall2Wall PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(wkWall2Wall PRIVATE ddraw gdi32 opengl32 advapi32 version)
+target_link_libraries(wkWall2Wall PRIVATE ddraw gdi32 opengl32 advapi32 version winmm)
 
 set_target_properties(wkWall2Wall PROPERTIES
     OUTPUT_NAME "wkWall2Wall"

@@ -1,10 +1,11 @@
 build/
 .local/
+.codex/
 debug_walls/
 debug_walls_exact/
-maps/
-walls/
-walls_exact/
+/maps/
+/walls/
+/walls_exact/
 tools/toolchains/
 tools/reverse/
 tools/__pycache__/

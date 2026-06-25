@@ -365,6 +365,14 @@ DWORD WINAPI initializeModule(LPVOID) {
         logger.info(config.enableDirect3D9DeviceSlotProbe ? "Direct3D9 device slot runtime probe enabled" : "Direct3D9 device slot runtime probe disabled");
         logger.info(config.enableDirect3D9OverlaySmokeTest ? "Direct3D9 overlay smoke test enabled" : "Direct3D9 overlay smoke test disabled");
         logger.info(config.enableDirect3D9TrackingTargetOverlayTest ? "Direct3D9 tracking target overlay test enabled" : "Direct3D9 tracking target overlay test disabled");
+        {
+            std::ostringstream soundMessage;
+            soundMessage << (config.enableSounds ? "custom wall sounds enabled" : "custom wall sounds disabled")
+                         << ", volume "
+                         << config.soundVolumePercent
+                         << "%";
+            logger.info(soundMessage.str());
+        }
 
         const std::string wallMetadataDirectory = isAbsolutePath(config.wallMetadataDirectory)
             ? config.wallMetadataDirectory
@@ -447,6 +455,13 @@ DWORD WINAPI initializeModule(LPVOID) {
             }
         }
 
+        WaSoundConfig soundConfig;
+        soundConfig.enabled = config.enableSounds;
+        soundConfig.volumePercent = config.soundVolumePercent;
+        soundConfig.wallTouchedSoundPaths = config.wallTouchedSoundPaths;
+        soundConfig.wallTouchedExtraSoundPath = config.wallTouchedExtraSoundPath;
+        soundConfig.allWallsTouchedSoundPath = config.allWallsTouchedSoundPath;
+
         if (config.enableHooks) {
             g_hookManager = std::make_unique<WaHookManager>();
             std::string hookError;
@@ -464,6 +479,7 @@ DWORD WINAPI initializeModule(LPVOID) {
                     direct3D9OverlayTestRects,
                     direct3D9OverlayMaps,
                     direct3D9OverlayTransform,
+                    soundConfig,
                     hookError)) {
                 g_hookManager.reset();
                 logger.warn("hook initialization skipped: " + hookError);

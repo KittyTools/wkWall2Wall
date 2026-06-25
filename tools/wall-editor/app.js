@@ -85,6 +85,8 @@ const state = {
   history: [],
   redoStack: [],
   pendingInspectorSnapshot: null,
+  clipboardWall: null,
+  clipboardPasteCount: 0,
 };
 
 function setStatus(message) {
@@ -454,6 +456,68 @@ function createWall(rect) {
   refreshWallList();
   draw();
   pushHistory(before);
+}
+
+function clampWallRectToMap(rect) {
+  const w = Math.max(1, Math.min(Math.round(rect.w), Math.max(1, state.mapWidth)));
+  const h = Math.max(1, Math.min(Math.round(rect.h), Math.max(1, state.mapHeight)));
+  return {
+    x: clamp(Math.round(rect.x), 0, Math.max(0, state.mapWidth - w)),
+    y: clamp(Math.round(rect.y), 0, Math.max(0, state.mapHeight - h)),
+    w,
+    h,
+  };
+}
+
+function copySelectedWall() {
+  const selected = getSelectedWall();
+  if (!selected) {
+    setStatus("No wall selected to copy.");
+    return;
+  }
+
+  state.clipboardWall = {
+    name: selected.name,
+    x: selected.x,
+    y: selected.y,
+    w: selected.w,
+    h: selected.h,
+    color: selected.color,
+  };
+  state.clipboardPasteCount = 0;
+  setStatus(`${selected.name || "Selected wall"} copied.`);
+}
+
+function pasteCopiedWall() {
+  if (!state.image) {
+    setStatus("Load a map before pasting a wall.");
+    return;
+  }
+
+  if (!state.clipboardWall) {
+    setStatus("No copied wall to paste.");
+    return;
+  }
+
+  const before = captureSnapshot();
+  state.clipboardPasteCount += 1;
+  const offset = 12 * state.clipboardPasteCount;
+  const rect = clampWallRectToMap({
+    ...state.clipboardWall,
+    x: state.clipboardWall.x + offset,
+    y: state.clipboardWall.y + offset,
+  });
+  const wall = {
+    id: state.nextWallId++,
+    name: `Wall${state.nextWallId - 1}`,
+    ...rect,
+    color: state.clipboardWall.color,
+  };
+
+  state.walls.push(wall);
+  selectWall(wall.id);
+  pushHistory(before);
+  setStatus("Copied wall pasted.");
 }
 
 function selectWall(id) {
@@ -1150,6 +1214,14 @@ document.addEventListener("keydown", (event) => {
   }
 
   const key = event.key.toLowerCase();
+  if (key === "c" && !event.shiftKey) {
+    event.preventDefault();
+    copySelectedWall();
+  }
+  if (key === "v" && !event.shiftKey) {
+    event.preventDefault();
+    pasteCopiedWall();
+  }
   if (key === "z" && !event.shiftKey) {
     event.preventDefault();
     undoChange();
