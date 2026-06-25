@@ -18,6 +18,7 @@ Current alpha build supports:
 - detecting wall touches from W:A physics/collision hooks
 - rope collisions, walking contacts, jump contacts, and low-speed rope drop contacts
 - resetting touched walls from W:A turn-end messages
+- blocking destructive attacks until all configured walls are touched and at least one crate has been collected
 - automatic loading of cached map metadata when W:A reuses the last played map
 - keeping offline play usable for local testing
 - keeping maps without matching wall metadata passive
@@ -62,7 +63,7 @@ Default touch sounds are loaded from:
 User\Walls\Sounds
 ```
 
-You can replace the `.wav` files or edit the `[Sounds]` section in `wkWall2Wall.ini`.
+You can replace the `.wav` files or edit the `[Sounds]` section in `wkWall2Wall.ini`. The same section controls wall touch sounds, the all-walls-touched sound, and the warning sounds played when an attack is blocked before the wall or crate requirements are complete.
 
 Worms Armageddon maps should stay in the normal W:A user map location:
 

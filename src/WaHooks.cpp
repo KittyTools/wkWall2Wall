@@ -84,6 +84,7 @@ constexpr DWORD kOverlayGameplayGraceMilliseconds = 250;
 constexpr DWORD kDetectedMapCacheRefreshWindowMilliseconds = 15000;
 constexpr DWORD kDirectDrawSurfaceTransitionDebounceMilliseconds = 750;
 constexpr DWORD kDirectDrawSurfaceTransitionDrawCooldownMilliseconds = 1000;
+constexpr DWORD kBlockedAttackWarningSoundCooldownMilliseconds = 1200;
 
 bool waObjectKindLooksLikeWorm(LONG objectKind) {
     return objectKind == kWaObjectKindWorm || objectKind == 101;
@@ -284,6 +285,8 @@ WaTurnGameHandleMessageFunction g_originalWaTurnGameHandleMessage = nullptr;
 Logger* g_runtimeProbeLogger = nullptr;
 volatile LONG g_getMessageProbeHits = 0;
 volatile LONG g_peekMessageProbeHits = 0;
+volatile LONG g_weaponInputBlockLogCount = 0;
+volatile LONG g_blockedWeaponInputKeyMask = 0;
 volatile LONG g_swapBuffersProbeHits = 0;
 volatile LONG g_bitBltProbeHits = 0;
 volatile LONG g_stretchBltProbeHits = 0;
@@ -643,6 +646,9 @@ volatile LONG g_direct3D9OverlayGameplayActive = 0;
 volatile LONG g_direct3D9OverlayGameplayLogCount = 0;
 volatile LONG g_wallSoundLogCount = 0;
 volatile LONG g_wallSoundMissingLogCount = 0;
+volatile LONG g_wallWarningSoundLastTick = 0;
+volatile LONG g_crateCollectedThisTurn = 0;
+volatile LONG g_crateCollectionLogCount = 0;
 volatile LONG g_chatOverlayActive = 0;
 volatile LONG g_chatOverlayHiddenLogCount = 0;
 volatile LONG g_chatInputLogCount = 0;
@@ -1286,6 +1292,7 @@ const char* waTaskMessageName(std::uint32_t messageType) {
 
 bool waTaskMessageLooksTurnRelated(std::uint32_t messageType) {
     switch (messageType) {
+    case 7:
     case 49:
     case 52:
     case 53:
@@ -1293,6 +1300,7 @@ bool waTaskMessageLooksTurnRelated(std::uint32_t messageType) {
     case 57:
     case 58:
     case 60:
+    case 73:
         return true;
     default:
         return false;
@@ -1304,6 +1312,12 @@ enum class OpenGLOverlayPass {
     AfterGlEnd,
 };
 void drawOpenGLOverlayTestRects(OpenGLOverlayPass pass);
+
+enum class AttackBlockReason {
+    None,
+    WallsIncomplete,
+    CrateMissing,
+};
 
 LONG readTurnGameLong(void* turnGame, std::uintptr_t offset) {
     if (turnGame == nullptr) {
@@ -1365,7 +1379,8 @@ void logTurnGameMessageProbe(
             << " roundTimer " << roundTimer
             << " turnTimer188 " << turnTimerA
             << " turnTimer18C " << turnTimerB
-            << " touchedWalls " << touchedOverlayWallCount();
+            << " touchedWalls " << touchedOverlayWallCount()
+            << " crateCollected " << (g_crateCollectedThisTurn != 0 ? "yes" : "no");
     g_runtimeProbeLogger->info(message.str());
 }
 
@@ -1412,6 +1427,37 @@ void resetTouchedOverlayWallsForTurnGameFinishTurn(void* turnGame, void* data, s
                 << " touched wall(s)";
         g_runtimeProbeLogger->info(message.str());
     }
+}
+
+void resetCrateCollectionForNewTurn(const char* reason) {
+    const LONG previous = InterlockedExchange(&g_crateCollectedThisTurn, 0);
+    InterlockedExchange(&g_wallWarningSoundLastTick, 0);
+    if (previous == 0 || g_runtimeProbeLogger == nullptr || g_crateCollectionLogCount >= 32) {
+        return;
+    }
+
+    InterlockedIncrement(&g_crateCollectionLogCount);
+    std::ostringstream message;
+    message << "runtime probe: crate collection state reset for "
+            << (reason != nullptr && reason[0] != '\0' ? reason : "new turn");
+    g_runtimeProbeLogger->info(message.str());
+}
+
+void markCrateCollectedThisTurn(void* sender, void* data, std::size_t dataSize) {
+    const LONG previous = InterlockedExchange(&g_crateCollectedThisTurn, 1);
+    if (previous != 0 || g_runtimeProbeLogger == nullptr || g_crateCollectionLogCount >= 32) {
+        return;
+    }
+
+    InterlockedIncrement(&g_crateCollectionLogCount);
+    std::ostringstream message;
+    message << "runtime probe: crate collected for attack requirement"
+            << " sender " << formatAddress(reinterpret_cast<std::uintptr_t>(sender))
+            << " data " << formatAddress(reinterpret_cast<std::uintptr_t>(data))
+            << " size " << dataSize
+            << " touchedWalls " << touchedOverlayWallCount()
+            << "/" << g_direct3D9OverlayTestRects.size();
+    g_runtimeProbeLogger->info(message.str());
 }
 
 bool tryReadByte(std::uintptr_t address, BYTE& value) {
@@ -1496,6 +1542,34 @@ std::size_t touchedOverlayWallCount() {
         }
     }
     return count;
+}
+
+AttackBlockReason currentAttackBlockReason() {
+    const std::size_t totalWalls = g_direct3D9OverlayTestRects.size();
+    if (g_direct3D9ActiveOverlayMapIndex < 0 || totalWalls == 0) {
+        return AttackBlockReason::None;
+    }
+
+    if (touchedOverlayWallCount() < totalWalls) {
+        return AttackBlockReason::WallsIncomplete;
+    }
+
+    if (g_crateCollectedThisTurn == 0) {
+        return AttackBlockReason::CrateMissing;
+    }
+
+    return AttackBlockReason::None;
+}
+
+const char* attackBlockReasonName(AttackBlockReason reason) {
+    switch (reason) {
+    case AttackBlockReason::WallsIncomplete:
+        return "walls incomplete";
+    case AttackBlockReason::CrateMissing:
+        return "crate missing";
+    default:
+        return "";
+    }
 }
 
 bool wallSoundFileExists(const std::string& path) {
@@ -1731,6 +1805,36 @@ void playWallTouchedSoundForCount(std::size_t touchedCount, std::size_t totalWal
     } else {
         playWallSoundPath(g_soundConfig.wallTouchedExtraSoundPath);
     }
+}
+
+void playBlockedAttackWarningSound(AttackBlockReason reason) {
+    if (!g_soundConfig.enabled || g_soundConfig.volumePercent <= 0) {
+        return;
+    }
+
+    const std::string* path = nullptr;
+    switch (reason) {
+    case AttackBlockReason::WallsIncomplete:
+        path = &g_soundConfig.warningWallsSoundPath;
+        break;
+    case AttackBlockReason::CrateMissing:
+        path = &g_soundConfig.warningCrateSoundPath;
+        break;
+    default:
+        return;
+    }
+    if (path == nullptr || path->empty()) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    const DWORD previous = static_cast<DWORD>(g_wallWarningSoundLastTick);
+    if (previous != 0 && now - previous < kBlockedAttackWarningSoundCooldownMilliseconds) {
+        return;
+    }
+
+    InterlockedExchange(&g_wallWarningSoundLastTick, static_cast<LONG>(now));
+    playWallSoundPath(*path);
 }
 
 void rememberWaStateUiAddress(std::uintptr_t stateUiAddress) {
@@ -2015,6 +2119,7 @@ void resetWormLiveSampleTransientHistory(WormLiveSample& sample) {
 
 void resetTransientGameplayTrackingState(const char* reason, bool clearWormSamples) {
     const std::size_t resetWallCount = resetTouchedOverlayWallsForNewTurn();
+    resetCrateCollectionForNewTurn(reason);
     resetCollisionDiagnosticLogWindows();
     InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
@@ -4522,7 +4627,12 @@ int __fastcall hookedWaTurnGameHandleMessage(
         logTurnGameMessageProbe("after", turnGame, sender, messageType, dataSize, data, result);
     }
 
+    if (messageType == 7) {
+        markCrateCollectedThisTurn(sender, data, dataSize);
+    }
+
     if (messageType == 52) {
+        resetCrateCollectionForNewTurn("CTaskTurnGame FinishTurn");
         resetTouchedOverlayWallsForTurnGameFinishTurn(turnGame, data, dataSize);
     }
 
@@ -9047,6 +9157,249 @@ bool controlKeyDown() {
         || (GetKeyState(VK_RCONTROL) & 0x8000) != 0;
 }
 
+const char* weaponInputKeyName(int key) {
+    switch (key) {
+    case VK_LBUTTON:
+        return "LButton";
+    case VK_RBUTTON:
+        return "RButton";
+    case VK_SPACE:
+        return "Space";
+    case VK_RETURN:
+        return "Enter";
+    case VK_BACK:
+        return "Backspace";
+    case VK_TAB:
+        return "Tab";
+    case VK_ESCAPE:
+        return "Escape";
+    case VK_F1:
+        return "F1";
+    case VK_F2:
+        return "F2";
+    case VK_F3:
+        return "F3";
+    case VK_F4:
+        return "F4";
+    case VK_F5:
+        return "F5";
+    case VK_F6:
+        return "F6";
+    case VK_F7:
+        return "F7";
+    case VK_F8:
+        return "F8";
+    case VK_F9:
+        return "F9";
+    case VK_F10:
+        return "F10";
+    case VK_F11:
+        return "F11";
+    case VK_F12:
+        return "F12";
+    default:
+        if (key >= '0' && key <= '9') {
+            static thread_local char digitName[2] = {};
+            digitName[0] = static_cast<char>(key);
+            digitName[1] = '\0';
+            return digitName;
+        }
+        return nullptr;
+    }
+}
+
+bool weaponInputKeyCanFire(int key) {
+    return key == VK_SPACE || key == VK_RETURN;
+}
+
+LONG weaponInputKeyMask(int key) {
+    switch (key) {
+    case VK_SPACE:
+        return 1;
+    case VK_RETURN:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+bool tryReadActiveSelectedWeaponId(LONG& weaponId) {
+    weaponId = -1;
+
+    const std::uintptr_t activeOwnerAddress =
+        static_cast<std::uintptr_t>(static_cast<DWORD>(g_activeWormCandidateOwnerAddress));
+    if (activeOwnerAddress == 0) {
+        return false;
+    }
+
+    return tryReadLong(activeOwnerAddress + 0x170, weaponId);
+}
+
+bool tryReadActiveOwnerKind(LONG& ownerKind) {
+    ownerKind = 0;
+
+    const std::uintptr_t activeOwnerAddress =
+        static_cast<std::uintptr_t>(static_cast<DWORD>(g_activeWormCandidateOwnerAddress));
+    if (activeOwnerAddress == 0) {
+        return false;
+    }
+
+    return tryReadLong(activeOwnerAddress + kWaObjectKindOffset, ownerKind);
+}
+
+bool selectedWeaponIsUtilityBeforeWalls(LONG weaponId) {
+    switch (weaponId) {
+    case 37:
+    case 38:
+    case 39:
+    case 40:
+    case 41:
+    case 42:
+    case 43:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool activeOwnerLooksLikeRopeContext() {
+    LONG ownerKind = 0;
+    if (!tryReadActiveOwnerKind(ownerKind)) {
+        return false;
+    }
+
+    return ownerKind == 115
+        || ownerKind == 123
+        || ownerKind == 127
+        || ownerKind == 128;
+}
+
+bool attackRuleShouldBlockWeaponInput(int key, LONG& weaponId, AttackBlockReason& reason) {
+    weaponId = -1;
+    reason = AttackBlockReason::None;
+    if (!weaponInputKeyCanFire(key)) {
+        return false;
+    }
+
+    reason = currentAttackBlockReason();
+    if (reason == AttackBlockReason::None) {
+        return false;
+    }
+
+    const bool ropeContext = activeOwnerLooksLikeRopeContext();
+    if (key == VK_RETURN && !ropeContext) {
+        return false;
+    }
+
+    if (!tryReadActiveSelectedWeaponId(weaponId)) {
+        return true;
+    }
+
+    if (key == VK_SPACE && ropeContext) {
+        return false;
+    }
+
+    return !selectedWeaponIsUtilityBeforeWalls(weaponId);
+}
+
+const char* weaponWindowMessageName(UINT message) {
+    switch (message) {
+    case WM_KEYDOWN:
+        return "WM_KEYDOWN";
+    case WM_KEYUP:
+        return "WM_KEYUP";
+    case WM_SYSKEYDOWN:
+        return "WM_SYSKEYDOWN";
+    case WM_SYSKEYUP:
+        return "WM_SYSKEYUP";
+    default:
+        return "WM_OTHER";
+    }
+}
+
+void logBlockedWeaponInput(const MSG& message, const char* source, LONG weaponId, const char* reason) {
+    if (g_runtimeProbeLogger == nullptr) {
+        return;
+    }
+
+    const LONG logCount = InterlockedIncrement(&g_weaponInputBlockLogCount);
+    if (logCount > 48) {
+        return;
+    }
+
+    const int key = static_cast<int>(message.wParam);
+    std::ostringstream log;
+    log << "runtime: attack rule blocked weapon input "
+        << source
+        << " " << weaponWindowMessageName(message.message)
+        << " " << (weaponInputKeyName(key) != nullptr ? weaponInputKeyName(key) : "?")
+        << " weaponId " << weaponId
+        << " reason " << (reason != nullptr ? reason : "")
+        << " touchedWalls " << touchedOverlayWallCount()
+        << "/" << g_direct3D9OverlayTestRects.size()
+        << " crateCollected " << (g_crateCollectedThisTurn != 0 ? "yes" : "no")
+        << " activeMap " << g_direct3D9ActiveOverlayMapIndex;
+    g_runtimeProbeLogger->info(log.str());
+}
+
+bool consumeBlockedWeaponWindowInput(MSG& message, const char* source, UINT peekRemoveMessage) {
+    const UINT msg = message.message;
+    if (msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN && msg != WM_KEYUP && msg != WM_SYSKEYUP) {
+        return false;
+    }
+
+    const int key = static_cast<int>(message.wParam);
+    if (!weaponInputKeyCanFire(key)) {
+        return false;
+    }
+
+    if (source != nullptr
+        && std::strcmp(source, "PeekMessageA") == 0
+        && (peekRemoveMessage & PM_REMOVE) == 0) {
+        return false;
+    }
+
+    const bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    const LONG keyMask = weaponInputKeyMask(key);
+    if (!down && keyMask != 0 && (g_blockedWeaponInputKeyMask & keyMask) != 0) {
+        InterlockedAnd(&g_blockedWeaponInputKeyMask, ~keyMask);
+        logBlockedWeaponInput(message, source, -1, "matching key up");
+        message.message = WM_NULL;
+        message.wParam = 0;
+        message.lParam = 0;
+        return true;
+    }
+
+    if (!down) {
+        return false;
+    }
+
+    if (keyMask != 0 && (g_blockedWeaponInputKeyMask & keyMask) != 0) {
+        logBlockedWeaponInput(message, source, -1, "held key down");
+        message.message = WM_NULL;
+        message.wParam = 0;
+        message.lParam = 0;
+        return true;
+    }
+
+    LONG weaponId = -1;
+    AttackBlockReason blockReason = AttackBlockReason::None;
+    if (!attackRuleShouldBlockWeaponInput(key, weaponId, blockReason)) {
+        return false;
+    }
+
+    if (keyMask != 0) {
+        InterlockedOr(&g_blockedWeaponInputKeyMask, keyMask);
+    }
+
+    logBlockedWeaponInput(message, source, weaponId, attackBlockReasonName(blockReason));
+    playBlockedAttackWarningSound(blockReason);
+    message.message = WM_NULL;
+    message.wParam = 0;
+    message.lParam = 0;
+    return true;
+}
+
 void scheduleChatOverlayScan(DWORD delayMilliseconds) {
     InterlockedExchange(&g_chatOverlayDetectedOffsetValid, 0);
     InterlockedExchange(&g_chatOverlayDetectedOffsetY, 0);
@@ -9307,6 +9660,7 @@ BOOL WINAPI hookedGetMessageA(LPMSG message, HWND window, UINT messageFilterMin,
 
     const BOOL result = g_originalGetMessageA(message, window, messageFilterMin, messageFilterMax);
     if (result > 0 && message != nullptr) {
+        consumeBlockedWeaponWindowInput(*message, "GetMessageA", 0);
         updateChatOverlayStateFromWindowMessage(*message);
     }
 
@@ -9326,6 +9680,7 @@ BOOL WINAPI hookedPeekMessageA(LPMSG message, HWND window, UINT messageFilterMin
 
     const BOOL result = g_originalPeekMessageA(message, window, messageFilterMin, messageFilterMax, removeMessage);
     if (result && message != nullptr) {
+        consumeBlockedWeaponWindowInput(*message, "PeekMessageA", removeMessage);
         updateChatOverlayStateFromWindowMessage(*message);
     }
 
@@ -10067,8 +10422,13 @@ bool WaHookManager::initialize(
     }
     InterlockedExchange(&g_getMessageProbeHits, 0);
     InterlockedExchange(&g_peekMessageProbeHits, 0);
+    InterlockedExchange(&g_weaponInputBlockLogCount, 0);
+    InterlockedExchange(&g_blockedWeaponInputKeyMask, 0);
     InterlockedExchange(&g_wallSoundLogCount, 0);
     InterlockedExchange(&g_wallSoundMissingLogCount, 0);
+    InterlockedExchange(&g_wallWarningSoundLastTick, 0);
+    InterlockedExchange(&g_crateCollectedThisTurn, 0);
+    InterlockedExchange(&g_crateCollectionLogCount, 0);
     InterlockedExchange(&g_chatOverlayActive, 0);
     InterlockedExchange(&g_chatOverlayHiddenLogCount, 0);
     InterlockedExchange(&g_chatInputLogCount, 0);
