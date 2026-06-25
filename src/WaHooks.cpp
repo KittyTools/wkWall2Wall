@@ -7395,6 +7395,27 @@ bool prepareMetadataOverlayScreenRects(
     return !screenRects.empty();
 }
 
+bool metadataOverlayHiddenByChatForFallbackRenderer(const char* rendererName) {
+    activatePendingChatOverlayPinnedModeIfReady();
+
+    if (g_chatOverlayActive == 0
+        && g_chatOverlayPinnedMode == 0
+        && g_chatOverlayPinnedPending == 0) {
+        return false;
+    }
+
+    const LONG hits = InterlockedIncrement(&g_chatOverlayHiddenLogCount);
+    if (hits <= 8 && g_runtimeProbeLogger != nullptr) {
+        std::ostringstream message;
+        message << "runtime: "
+                << (rendererName != nullptr ? rendererName : "renderer")
+                << " metadata overlay hidden while W:A chat is active";
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    return true;
+}
+
 void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
     UINT renderTargetWidth = 0;
     UINT renderTargetHeight = 0;
@@ -7570,6 +7591,10 @@ void drawOpenGLOverlayTestRects(OpenGLOverlayPass pass) {
     UINT viewportWidth = 0;
     UINT viewportHeight = 0;
     if (!getOpenGLViewportSize(viewportWidth, viewportHeight)) {
+        return;
+    }
+
+    if (metadataOverlayHiddenByChatForFallbackRenderer("OpenGL")) {
         return;
     }
 
@@ -7897,6 +7922,10 @@ void drawDirectDrawOverlayTestRects(
     }
 
     if (directDrawSurfaceTransitionCooldownActive()) {
+        return;
+    }
+
+    if (metadataOverlayHiddenByChatForFallbackRenderer("DirectDraw")) {
         return;
     }
 
