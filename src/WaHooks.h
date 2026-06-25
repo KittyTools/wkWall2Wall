@@ -55,6 +55,7 @@ struct WaSoundConfig {
     std::string allWallsTouchedSoundPath;
     std::string warningWallsSoundPath;
     std::string warningCrateSoundPath;
+    std::string warningRopeSoundPath;
 };
 
 class X86DetourHook {

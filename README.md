@@ -63,7 +63,7 @@ Default touch sounds are loaded from:
 User\Walls\Sounds
 ```
 
-You can replace the `.wav` files or edit the `[Sounds]` section in `wkWall2Wall.ini`. The same section controls wall touch sounds, the all-walls-touched sound, and the warning sounds played when an attack is blocked before the wall or crate requirements are complete.
+You can replace the `.wav` files or edit the `[Sounds]` section in `wkWall2Wall.ini`. The same section controls wall touch sounds, the all-walls-touched sound, and the warning sounds played when an attack is blocked before the wall, crate, or attack-from-rope requirements are complete.
 
 Worms Armageddon maps should stay in the normal W:A user map location:
 

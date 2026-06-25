@@ -463,6 +463,7 @@ DWORD WINAPI initializeModule(LPVOID) {
         soundConfig.allWallsTouchedSoundPath = config.allWallsTouchedSoundPath;
         soundConfig.warningWallsSoundPath = config.warningWallsSoundPath;
         soundConfig.warningCrateSoundPath = config.warningCrateSoundPath;
+        soundConfig.warningRopeSoundPath = config.warningRopeSoundPath;
 
         if (config.enableHooks) {
             g_hookManager = std::make_unique<WaHookManager>();

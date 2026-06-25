@@ -90,6 +90,7 @@ Config Config::load(const std::string& gameDirectory) {
     config.allWallsTouchedSoundPath = readPathValue(iniPath, gameDirectory, "Sounds", "AllWallsTouched", "User\\Walls\\Sounds\\all_walls_touched.wav");
     config.warningWallsSoundPath = readPathValue(iniPath, gameDirectory, "Sounds", "WarningWalls", "User\\Walls\\Sounds\\warning_walls.wav");
     config.warningCrateSoundPath = readPathValue(iniPath, gameDirectory, "Sounds", "WarningCrate", "User\\Walls\\Sounds\\warning_crate.wav");
+    config.warningRopeSoundPath = readPathValue(iniPath, gameDirectory, "Sounds", "WarningRope", "User\\Walls\\Sounds\\warning_afr.wav");
 
     if (config.touchRadiusPixels < 1) {
         config.touchRadiusPixels = 1;

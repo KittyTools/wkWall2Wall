@@ -85,6 +85,7 @@ constexpr DWORD kDetectedMapCacheRefreshWindowMilliseconds = 15000;
 constexpr DWORD kDirectDrawSurfaceTransitionDebounceMilliseconds = 750;
 constexpr DWORD kDirectDrawSurfaceTransitionDrawCooldownMilliseconds = 1000;
 constexpr DWORD kBlockedAttackWarningSoundCooldownMilliseconds = 1200;
+constexpr DWORD kUtilityActionSelectionGraceMilliseconds = 5000;
 
 bool waObjectKindLooksLikeWorm(LONG objectKind) {
     return objectKind == kWaObjectKindWorm || objectKind == 101;
@@ -287,6 +288,7 @@ volatile LONG g_getMessageProbeHits = 0;
 volatile LONG g_peekMessageProbeHits = 0;
 volatile LONG g_weaponInputBlockLogCount = 0;
 volatile LONG g_blockedWeaponInputKeyMask = 0;
+volatile LONG g_utilityActionSelectionGraceUntilTick = 0;
 volatile LONG g_swapBuffersProbeHits = 0;
 volatile LONG g_bitBltProbeHits = 0;
 volatile LONG g_stretchBltProbeHits = 0;
@@ -1317,6 +1319,7 @@ enum class AttackBlockReason {
     None,
     WallsIncomplete,
     CrateMissing,
+    RopeRequired,
 };
 
 LONG readTurnGameLong(void* turnGame, std::uintptr_t offset) {
@@ -1561,12 +1564,19 @@ AttackBlockReason currentAttackBlockReason() {
     return AttackBlockReason::None;
 }
 
+bool attackRulesApplyToCurrentMap() {
+    return g_direct3D9ActiveOverlayMapIndex >= 0
+        && !g_direct3D9OverlayTestRects.empty();
+}
+
 const char* attackBlockReasonName(AttackBlockReason reason) {
     switch (reason) {
     case AttackBlockReason::WallsIncomplete:
         return "walls incomplete";
     case AttackBlockReason::CrateMissing:
         return "crate missing";
+    case AttackBlockReason::RopeRequired:
+        return "rope required";
     default:
         return "";
     }
@@ -1819,6 +1829,9 @@ void playBlockedAttackWarningSound(AttackBlockReason reason) {
         break;
     case AttackBlockReason::CrateMissing:
         path = &g_soundConfig.warningCrateSoundPath;
+        break;
+    case AttackBlockReason::RopeRequired:
+        path = &g_soundConfig.warningRopeSoundPath;
         break;
     default:
         return;
@@ -9223,6 +9236,58 @@ LONG weaponInputKeyMask(int key) {
     }
 }
 
+bool messageIsKeyDown(UINT message) {
+    return message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+}
+
+void rememberUtilityActionSelectionInput(const MSG& message) {
+    if (!messageIsKeyDown(message.message) || static_cast<int>(message.wParam) != VK_F12) {
+        return;
+    }
+
+    const DWORD untilTick = GetTickCount() + kUtilityActionSelectionGraceMilliseconds;
+    InterlockedExchange(&g_utilityActionSelectionGraceUntilTick, static_cast<LONG>(untilTick));
+}
+
+bool keyLooksLikeWeaponSelection(int key) {
+    return (key >= VK_F1 && key <= VK_F11)
+        || (key >= '0' && key <= '9');
+}
+
+void cancelUtilityActionSelectionOnWeaponSwitch(const MSG& message) {
+    if (!messageIsKeyDown(message.message)) {
+        return;
+    }
+
+    const int key = static_cast<int>(message.wParam);
+    if (!keyLooksLikeWeaponSelection(key)) {
+        return;
+    }
+
+    InterlockedExchange(&g_utilityActionSelectionGraceUntilTick, 0);
+}
+
+bool consumeUtilityActionSelectionGrace() {
+    const LONG untilTick = g_utilityActionSelectionGraceUntilTick;
+    if (untilTick == 0) {
+        return false;
+    }
+
+    const DWORD now = GetTickCount();
+    if (static_cast<DWORD>(untilTick) - now > kUtilityActionSelectionGraceMilliseconds) {
+        InterlockedExchange(&g_utilityActionSelectionGraceUntilTick, 0);
+        return false;
+    }
+
+    if (static_cast<DWORD>(untilTick) < now) {
+        InterlockedExchange(&g_utilityActionSelectionGraceUntilTick, 0);
+        return false;
+    }
+
+    InterlockedExchange(&g_utilityActionSelectionGraceUntilTick, 0);
+    return true;
+}
+
 bool tryReadActiveSelectedWeaponId(LONG& weaponId) {
     weaponId = -1;
 
@@ -9247,15 +9312,46 @@ bool tryReadActiveOwnerKind(LONG& ownerKind) {
     return tryReadLong(activeOwnerAddress + kWaObjectKindOffset, ownerKind);
 }
 
-bool selectedWeaponIsUtilityBeforeWalls(LONG weaponId) {
+bool selectedWeaponBypassesAttackRequirements(LONG weaponId) {
     switch (weaponId) {
     case 37:
     case 38:
     case 39:
     case 40:
     case 41:
-    case 42:
-    case 43:
+    case 57: // Skip Go
+    case 58: // Surrender
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool selectedWeaponRequiresRopeToAttack(LONG weaponId) {
+    // These are the active selected-weapon values read from the live W:A object
+    // and validated in-game against the attack-from-rope weapon list.
+    switch (weaponId) {
+    case 0:  // Sheep
+    case 1:  // Banana Bomb / Sally Army / Super Banana Bomb
+    case 2:  // Holy Hand Grenade
+    case 3:  // Mole Bomb
+    case 4:  // Homing Missile
+    case 6:  // Dynamite
+    case 7:  // Bazooka
+    case 21: // Cluster Bomb
+    case 22: // Homing Pigeon
+    case 24: // Super Sheep
+    case 25: // Aqua Sheep
+    case 26: // Magic Bullet
+    case 33: // Petrol Bomb
+    case 42: // Sheep Launcher
+    case 43: // Grenade
+    case 45: // Pneumatic Drill
+    case 47: // Old Woman
+    case 49: // Ming Vase
+    case 52: // Land Mine
+    case 53: // Mortar
+    case 61: // Mad Cow
         return true;
     default:
         return false;
@@ -9281,8 +9377,7 @@ bool attackRuleShouldBlockWeaponInput(int key, LONG& weaponId, AttackBlockReason
         return false;
     }
 
-    reason = currentAttackBlockReason();
-    if (reason == AttackBlockReason::None) {
+    if (!attackRulesApplyToCurrentMap()) {
         return false;
     }
 
@@ -9291,15 +9386,32 @@ bool attackRuleShouldBlockWeaponInput(int key, LONG& weaponId, AttackBlockReason
         return false;
     }
 
+    const AttackBlockReason prerequisiteReason = currentAttackBlockReason();
     if (!tryReadActiveSelectedWeaponId(weaponId)) {
-        return true;
+        reason = prerequisiteReason;
+        return reason != AttackBlockReason::None;
     }
+
+    const bool ropeRequiredCandidate =
+        key == VK_SPACE
+        && !ropeContext
+        && selectedWeaponRequiresRopeToAttack(weaponId);
 
     if (key == VK_SPACE && ropeContext) {
         return false;
     }
 
-    return !selectedWeaponIsUtilityBeforeWalls(weaponId);
+    if (prerequisiteReason != AttackBlockReason::None) {
+        reason = prerequisiteReason;
+        return !selectedWeaponBypassesAttackRequirements(weaponId);
+    }
+
+    if (ropeRequiredCandidate) {
+        reason = AttackBlockReason::RopeRequired;
+        return true;
+    }
+
+    return false;
 }
 
 const char* weaponWindowMessageName(UINT message) {
@@ -9348,6 +9460,9 @@ bool consumeBlockedWeaponWindowInput(MSG& message, const char* source, UINT peek
         return false;
     }
 
+    rememberUtilityActionSelectionInput(message);
+    cancelUtilityActionSelectionOnWeaponSwitch(message);
+
     const int key = static_cast<int>(message.wParam);
     if (!weaponInputKeyCanFire(key)) {
         return false;
@@ -9359,8 +9474,12 @@ bool consumeBlockedWeaponWindowInput(MSG& message, const char* source, UINT peek
         return false;
     }
 
-    const bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    const bool down = messageIsKeyDown(msg);
     const LONG keyMask = weaponInputKeyMask(key);
+    if (down && consumeUtilityActionSelectionGrace()) {
+        return false;
+    }
+
     if (!down && keyMask != 0 && (g_blockedWeaponInputKeyMask & keyMask) != 0) {
         InterlockedAnd(&g_blockedWeaponInputKeyMask, ~keyMask);
         logBlockedWeaponInput(message, source, -1, "matching key up");
@@ -10424,6 +10543,7 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_peekMessageProbeHits, 0);
     InterlockedExchange(&g_weaponInputBlockLogCount, 0);
     InterlockedExchange(&g_blockedWeaponInputKeyMask, 0);
+    InterlockedExchange(&g_utilityActionSelectionGraceUntilTick, 0);
     InterlockedExchange(&g_wallSoundLogCount, 0);
     InterlockedExchange(&g_wallSoundMissingLogCount, 0);
     InterlockedExchange(&g_wallWarningSoundLastTick, 0);

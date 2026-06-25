@@ -40,6 +40,7 @@ struct Config {
     std::string allWallsTouchedSoundPath = "User\\Walls\\Sounds\\all_walls_touched.wav";
     std::string warningWallsSoundPath = "User\\Walls\\Sounds\\warning_walls.wav";
     std::string warningCrateSoundPath = "User\\Walls\\Sounds\\warning_crate.wav";
+    std::string warningRopeSoundPath = "User\\Walls\\Sounds\\warning_afr.wav";
 
     static Config load(const std::string& gameDirectory);
 };
