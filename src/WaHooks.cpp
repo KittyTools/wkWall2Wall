@@ -3367,7 +3367,7 @@ void resetTransientGameplayTrackingState(const char* reason, bool clearWormSampl
     resetCollisionDiagnosticLogWindows();
     InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
-    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, static_cast<LONG>(GetTickCount() + 450));
+    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
     if (resetWallCount != 0) {
         InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(GetTickCount()));
     }
@@ -9585,26 +9585,6 @@ void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
         return;
     }
 
-    const LONG pinnedAutoProbeTick = g_chatOverlayPinnedAutoProbeTick;
-    if (pinnedAutoProbeTick != 0
-        && g_chatOverlayActive == 0
-        && g_chatOverlayPinnedMode == 0
-        && g_chatOverlayPinnedPending == 0) {
-        const DWORD now = GetTickCount();
-        if (static_cast<LONG>(now - static_cast<DWORD>(pinnedAutoProbeTick)) >= 0
-            && InterlockedCompareExchange(&g_chatOverlayPinnedAutoProbeTick, 0, pinnedAutoProbeTick) == pinnedAutoProbeTick) {
-            int ignoredPinnedOffsetY = 0;
-            if (detectDirect3D9ChatOffsetFromRenderTarget(device, true, ignoredPinnedOffsetY)) {
-                activateChatOverlayPinnedMode();
-                InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
-                if (g_runtimeProbeLogger != nullptr && g_chatInputLogCount < 12) {
-                    InterlockedIncrement(&g_chatInputLogCount);
-                    g_runtimeProbeLogger->info("runtime: W:A chat overlay pinned mode auto-detected from render target");
-                }
-            }
-        }
-    }
-
     const LONG pendingScanTick = g_chatOverlayScanPendingTick;
     if (g_chatOverlayActive != 0 && g_chatOverlayPinnedMode == 0 && pendingScanTick != 0) {
         const DWORD now = GetTickCount();
@@ -11423,7 +11403,21 @@ bool recentRopeContextActive() {
     return tick != 0 && GetTickCount() - tick <= 250;
 }
 
+bool chatInputCapturesKeyboard() {
+    return g_chatOverlayActive != 0 && g_chatOverlayPinnedMode == 0;
+}
+
+void clearBlockedWeaponInputState() {
+    InterlockedExchange(&g_blockedWeaponInputKeyMask, 0);
+    InterlockedExchange(&g_blockedWeaponInputSuppressUntilTick, 0);
+}
+
 bool blockedWeaponInputKeyStateSuppressed(int key) {
+    if (chatInputCapturesKeyboard()) {
+        clearBlockedWeaponInputState();
+        return false;
+    }
+
     const LONG keyMask = weaponInputKeyMask(key);
     if (keyMask == 0) {
         return false;
@@ -11461,6 +11455,11 @@ bool attackRuleShouldBlockWeaponInput(int key, LONG& weaponId, AttackBlockReason
     weaponId = -1;
     reason = AttackBlockReason::None;
     if (!weaponInputKeyCanFire(key)) {
+        return false;
+    }
+
+    if (chatInputCapturesKeyboard()) {
+        clearBlockedWeaponInputState();
         return false;
     }
 
@@ -11558,9 +11557,13 @@ bool consumeBlockedWeaponWindowInput(MSG& message, const char* source, UINT peek
         return false;
     }
 
+    if (chatInputCapturesKeyboard()) {
+        clearBlockedWeaponInputState();
+        return false;
+    }
+
     if (!attackRulesApplyToCurrentMap()) {
-        InterlockedExchange(&g_blockedWeaponInputKeyMask, 0);
-        InterlockedExchange(&g_blockedWeaponInputSuppressUntilTick, 0);
+        clearBlockedWeaponInputState();
         return false;
     }
 
