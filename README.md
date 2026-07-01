@@ -43,6 +43,11 @@ Renderer status:
 - Direct3D 7: supported
 - OpenGL: supported with a simpler opaque highlight fallback
 
+Executable support:
+
+- W:A 3.8.1.0 Steam: supported
+- W:A 3.8.1.0 GOG: recognized by the module and ready for community testing
+
 ## Installation
 
 The easiest install path is the `release` folder.

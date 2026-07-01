@@ -32,7 +32,8 @@
 namespace {
 constexpr std::size_t kX86JumpBytes = 5;
 constexpr std::uint32_t kSupportedWa381Timestamp = 0x5FA8504C;
-constexpr std::uint32_t kSupportedWa381Checksum = 0x003775F1;
+constexpr std::uint32_t kSupportedWa381SteamChecksum = 0x003775F1;
+constexpr std::uint32_t kSupportedWa381GogChecksum = 0x003775F2;
 constexpr std::uint32_t kSupportedWa381EntryPointRva = 0x001D8B6C;
 constexpr std::size_t kSupportedWa381ImageSize = 0x00584000;
 constexpr std::uintptr_t kWa381CameraTrackingFunctionRva = 0x00142F70;
@@ -178,11 +179,24 @@ bool readPeFingerprint(const ProcessModuleView& module, WaPeFingerprint& fingerp
     return true;
 }
 
-bool isKnownWa381SteamImage(const WaPeFingerprint& fingerprint) {
-    return fingerprint.timestamp == kSupportedWa381Timestamp
-        && fingerprint.checksum == kSupportedWa381Checksum
-        && fingerprint.entryPointRva == kSupportedWa381EntryPointRva
-        && fingerprint.imageSize == kSupportedWa381ImageSize;
+const char* knownWa381Distribution(const WaPeFingerprint& fingerprint) {
+    if (fingerprint.timestamp != kSupportedWa381Timestamp
+        || fingerprint.entryPointRva != kSupportedWa381EntryPointRva
+        || fingerprint.imageSize != kSupportedWa381ImageSize) {
+        return nullptr;
+    }
+
+    if (fingerprint.checksum == kSupportedWa381SteamChecksum) {
+        return "Steam";
+    }
+    if (fingerprint.checksum == kSupportedWa381GogChecksum) {
+        return "GOG";
+    }
+    return nullptr;
+}
+
+bool isKnownWa381Image(const WaPeFingerprint& fingerprint) {
+    return knownWa381Distribution(fingerprint) != nullptr;
 }
 
 std::string formatRva(std::uintptr_t address, std::uintptr_t base) {
@@ -12915,9 +12929,14 @@ bool WaHookManager::initialize(
                            << ", image size " << fingerprint.imageSize << " bytes";
         logger.info(fingerprintMessage.str());
 
-        logger.info(isKnownWa381SteamImage(fingerprint)
-            ? "hook probe: recognized W:A 3.8.1 Steam executable fingerprint"
-            : "hook probe: W:A executable fingerprint is not in the current signature catalog");
+        if (const char* distribution = knownWa381Distribution(fingerprint)) {
+            std::ostringstream recognizedMessage;
+            recognizedMessage << "hook probe: recognized W:A 3.8.1 " << distribution
+                              << " executable fingerprint";
+            logger.info(recognizedMessage.str());
+        } else {
+            logger.info("hook probe: W:A executable fingerprint is not in the current signature catalog");
+        }
     } else {
         logger.warn("hook probe: failed to read PE fingerprint from main module");
     }
@@ -12940,8 +12959,8 @@ bool WaHookManager::initialize(
         return true;
     }
 
-    if (!readPeFingerprint(module, fingerprint) || !isKnownWa381SteamImage(fingerprint)) {
-        error = "runtime hook probes require the recognized W:A 3.8.1 Steam executable fingerprint";
+    if (!readPeFingerprint(module, fingerprint) || !isKnownWa381Image(fingerprint)) {
+        error = "runtime hook probes require a recognized W:A 3.8.1 Steam or GOG executable fingerprint";
         logger.warn(error);
         return false;
     }
