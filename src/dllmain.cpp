@@ -483,6 +483,8 @@ DWORD WINAPI initializeModule(LPVOID) {
                     direct3D9OverlayMaps,
                     direct3D9OverlayTransform,
                     soundConfig,
+                    config.enableOnlineSync,
+                    config.requireAllPlayersOnline,
                     hookError)) {
                 g_hookManager.reset();
                 logger.warn("hook initialization skipped: " + hookError);

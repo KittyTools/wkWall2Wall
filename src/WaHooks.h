@@ -122,11 +122,19 @@ public:
         const std::vector<WaOverlayMap>& direct3D9OverlayMaps,
         const WaOverlayTransform& direct3D9OverlayTransform,
         const WaSoundConfig& soundConfig,
+        bool enableOnlineSync,
+        bool requireAllPlayersOnline,
         std::string& error);
+
+    bool ensureGameplayHooks(Logger& logger, const char* reason);
+    void disableGameplayHooks(Logger& logger, const char* reason);
 
 private:
     IatHook getMessageHook_;
     IatHook peekMessageHook_;
+    IatHook getAsyncKeyStateHook_;
+    IatHook getKeyStateHook_;
+    IatHook getKeyboardStateHook_;
     IatHook swapBuffersHook_;
     IatHook bitBltHook_;
     IatHook stretchBltHook_;
@@ -145,5 +153,13 @@ private:
     X86DetourHook collisionQueryCommonHook_;
     X86DetourHook jumpTerrainCollisionResultHook_;
     X86DetourHook movementResolutionSecondaryResultHook_;
+    X86DetourHook direct3DCreate9ExportHook_;
+    X86DetourHook hostLobbyPacketHandlerHook_;
+    X86DetourHook clientLobbyPacketHandlerHook_;
+    X86DetourHook constructLobbyHostScreenHook_;
+    X86DetourHook constructLobbyClientScreenHook_;
+    std::uintptr_t moduleBase_ = 0;
+    std::size_t moduleSize_ = 0;
+    bool gameplayHookSupportEnabled_ = false;
     bool initialized_ = false;
 };

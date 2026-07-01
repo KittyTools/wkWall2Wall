@@ -1,6 +1,9 @@
 #include "WaHooks.h"
 
 #include "WaMemory.h"
+#include "WallGameMessage.h"
+#include "WallProtocol.h"
+#include "WallTransport.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -22,6 +25,7 @@
 #include <new>
 #include <sstream>
 #include <iomanip>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -81,11 +85,30 @@ constexpr DWORD kRecentMotionHandoffMilliseconds = 1500;
 constexpr DWORD kTurnGameFinishTurnResetDebounceMilliseconds = 1000;
 constexpr DWORD kOverlayWormEvidenceKeepMilliseconds = 1000;
 constexpr DWORD kOverlayGameplayGraceMilliseconds = 250;
+constexpr DWORD kDetectedMapCacheRefreshPollMilliseconds = 2500;
 constexpr DWORD kDetectedMapCacheRefreshWindowMilliseconds = 15000;
 constexpr DWORD kDirectDrawSurfaceTransitionDebounceMilliseconds = 750;
 constexpr DWORD kDirectDrawSurfaceTransitionDrawCooldownMilliseconds = 1000;
 constexpr DWORD kBlockedAttackWarningSoundCooldownMilliseconds = 1200;
 constexpr DWORD kUtilityActionSelectionGraceMilliseconds = 5000;
+constexpr bool kVerboseRuntimeDiagnostics = false;
+constexpr std::uint16_t kWallLobbyPacketMagic = 0x6666;
+constexpr std::uint16_t kWallLobbyChatPacketType = 0x0000;
+constexpr std::uint8_t kWallLobbyMessageVersionQuery = 1;
+constexpr std::uint8_t kWallLobbyMessageVersionInfo = 2;
+constexpr std::uint8_t kWallLobbyMessageMetadataFrame = 3;
+constexpr const char* kWallLobbyJsonNamespace = "wkWall2Wall";
+constexpr std::size_t kWaHostLobbyPacketHandlerPatchLength = 7;
+constexpr std::size_t kWaClientLobbyPacketHandlerPatchLength = 6;
+constexpr std::size_t kWaLobbyScreenConstructorPatchLength = 7;
+constexpr DWORD kOnlineLobbyBroadcastCooldownMilliseconds = 1000;
+constexpr DWORD kOnlineLobbyCompatibilityTimeoutMilliseconds = 3000;
+constexpr bool kOnlineLobbyHostUnicastEnabled = true;
+constexpr std::uintptr_t kWaHostSlotStride = 0x19118;
+constexpr std::uintptr_t kWaHostSlotDataOffset = 0x1A4;
+constexpr std::uintptr_t kWaHostSlotConnectionStateOffset = 0xB8;
+constexpr std::uintptr_t kWaHostSlotNicknameOffset = 0xD0;
+constexpr LONG kWaHostSlotConnectedState = 3;
 
 bool waObjectKindLooksLikeWorm(LONG objectKind) {
     return objectKind == kWaObjectKindWorm || objectKind == 101;
@@ -255,6 +278,9 @@ void logProbeSignatureMatches(Logger& logger, const ProcessModuleView& module) {
 
 using GetMessageAFunction = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT);
 using PeekMessageAFunction = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT, UINT);
+using GetAsyncKeyStateFunction = SHORT(WINAPI*)(int);
+using GetKeyStateFunction = SHORT(WINAPI*)(int);
+using GetKeyboardStateFunction = BOOL(WINAPI*)(PBYTE);
 using SwapBuffersFunction = BOOL(WINAPI*)(HDC);
 using BitBltFunction = BOOL(WINAPI*)(HDC, int, int, int, int, HDC, int, int, DWORD);
 using StretchBltFunction = BOOL(WINAPI*)(HDC, int, int, int, int, HDC, int, int, int, int, DWORD);
@@ -268,9 +294,19 @@ using DirectDrawCreateExFunction = HRESULT(WINAPI*)(GUID*, LPVOID*, REFIID, IUnk
 using OpenGLEndFunction = void(APIENTRY*)();
 using WaTurnGameHandleMessageFunction =
     int(__fastcall*)(void*, void*, void*, std::uint32_t, std::size_t, void*);
+using WaHostLobbyPacketHandlerFunction =
+    int(__fastcall*)(void*, void*, int, unsigned char*, std::size_t);
+using WaClientLobbyPacketHandlerFunction =
+    int(__fastcall*)(void*, void*, unsigned char*, std::size_t);
+using WaConstructLobbyScreenFunction = int(__stdcall*)(int, int);
+using WaLobbyDisplayMessageFunction = int(__stdcall*)(int, char*);
+using WaClientSendPacketFunction = int(__thiscall*)(void*, unsigned char*, std::size_t);
 
 GetMessageAFunction g_originalGetMessageA = nullptr;
 PeekMessageAFunction g_originalPeekMessageA = nullptr;
+GetAsyncKeyStateFunction g_originalGetAsyncKeyState = nullptr;
+GetKeyStateFunction g_originalGetKeyState = nullptr;
+GetKeyboardStateFunction g_originalGetKeyboardState = nullptr;
 SwapBuffersFunction g_originalSwapBuffers = nullptr;
 BitBltFunction g_originalBitBlt = nullptr;
 StretchBltFunction g_originalStretchBlt = nullptr;
@@ -283,12 +319,19 @@ DirectDrawCreateFunction g_originalDirectDrawCreate = nullptr;
 DirectDrawCreateExFunction g_originalDirectDrawCreateEx = nullptr;
 OpenGLEndFunction g_originalOpenGLEnd = nullptr;
 WaTurnGameHandleMessageFunction g_originalWaTurnGameHandleMessage = nullptr;
+WaHostLobbyPacketHandlerFunction g_originalWaHostLobbyPacketHandler = nullptr;
+WaClientLobbyPacketHandlerFunction g_originalWaClientLobbyPacketHandler = nullptr;
+WaConstructLobbyScreenFunction g_originalWaConstructLobbyHostScreen = nullptr;
+WaConstructLobbyScreenFunction g_originalWaConstructLobbyClientScreen = nullptr;
+WaLobbyDisplayMessageFunction g_waLobbyDisplayMessage = nullptr;
 Logger* g_runtimeProbeLogger = nullptr;
 volatile LONG g_getMessageProbeHits = 0;
 volatile LONG g_peekMessageProbeHits = 0;
 volatile LONG g_weaponInputBlockLogCount = 0;
 volatile LONG g_blockedWeaponInputKeyMask = 0;
+volatile LONG g_blockedWeaponInputSuppressUntilTick = 0;
 volatile LONG g_utilityActionSelectionGraceUntilTick = 0;
+volatile LONG g_recentRopeContextTick = 0;
 volatile LONG g_swapBuffersProbeHits = 0;
 volatile LONG g_bitBltProbeHits = 0;
 volatile LONG g_stretchBltProbeHits = 0;
@@ -398,11 +441,34 @@ volatile LONG g_movementResolutionResultNearWallLogCount = 0;
 volatile LONG g_turnGameHandleMessageProbeHits = 0;
 volatile LONG g_turnGameHandleMessageLogCount = 0;
 volatile LONG g_turnGameFinishTurnLastResetTick = 0;
+volatile LONG g_wallGameplayTaskActive = 0;
+volatile LONG g_wallGameplayTaskLastTick = 0;
 volatile LONG g_direct3D9OverlayLastGameplayEvidenceTick = 0;
 bool g_direct3D9ProbeEnabled = false;
 bool g_direct3D9DeviceSlotProbeEnabled = false;
 bool g_direct3D9OverlaySmokeTestEnabled = false;
+bool g_onlineSyncEnabled = false;
+bool g_onlineRequireAllPlayers = true;
+volatile LONG g_onlineMetadataBroadcastMapIndex = -1;
+volatile LONG g_onlineMetadataSendLogCount = 0;
+volatile LONG g_onlineMetadataReceiveLogCount = 0;
+volatile LONG g_onlineMetadataErrorLogCount = 0;
+volatile LONG g_onlineLobbyHookLogCount = 0;
+volatile LONG g_onlineLobbyPacketLogCount = 0;
+volatile LONG g_onlineLobbyMessageLogCount = 0;
+volatile LONG g_onlineLobbyLastBroadcastTick = 0;
+volatile LONG g_onlineLobbySeenSlotMask = 0;
+volatile LONG g_onlineLobbyCompatibleSlotMask = 0;
+volatile LONG g_onlineLobbyBroadcastSlotMask = 0;
+volatile LONG g_onlineLobbyQuerySlotMask = 0;
+volatile LONG g_onlineLobbyLastConnectedSlotMask = 0;
+volatile LONG g_onlineLobbyCompatibilityDeadlineTick = 0;
+volatile LONG g_onlineLobbyCompatibilityReported = 0;
+volatile LONG g_onlineMetadataTrustedOverlayMapIndex = -1;
+WaHookManager* g_activeHookManager = nullptr;
+std::mutex g_gameplayHookLifecycleMutex;
 void* g_cameraTrackingProbeStub = nullptr;
+void* g_cameraRenderCopyProbeStub = nullptr;
 void* g_cameraTargetAggregateProbeStub = nullptr;
 void* g_wormMotionCandidateProbeStub = nullptr;
 void* g_movementCollisionResultProbeStub = nullptr;
@@ -412,6 +478,13 @@ void* g_collisionQueryCommonProbeStub = nullptr;
 void* g_jumpTerrainCollisionResultProbeStub = nullptr;
 void* g_movementResolutionSecondaryResultProbeStub = nullptr;
 std::uintptr_t g_waModuleBase = 0;
+std::uintptr_t g_lobbyHostScreenAddress = 0;
+std::uintptr_t g_lobbyClientScreenAddress = 0;
+std::uintptr_t g_lobbyHostSlotAddress = 0;
+std::uintptr_t g_lobbyClientSlotAddress = 0;
+std::uintptr_t g_lobbyHostUnicastAddress = 0;
+std::uintptr_t g_lobbyHostIncomingConnectionAddress = 0;
+std::uintptr_t g_direct3DCreate9ExportTarget = 0;
 
 constexpr GUID kIUnknownGuid = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 constexpr GUID kIDirect3D9Guid = {0x81BDCBCA, 0x64D4, 0x426D, {0xAE, 0x8D, 0xAD, 0x01, 0x47, 0xF4, 0x27, 0x5C}};
@@ -669,6 +742,9 @@ volatile LONG g_chatOverlayPinnedCameraOffsetY = LONG_MIN;
 volatile LONG g_chatOverlayPinnedBaselineBaseY = LONG_MIN;
 volatile LONG g_chatOverlayLastUnpinnedBaseY = LONG_MIN;
 std::array<LONG, 5> g_chatOverlayScanSamples = {};
+std::mutex g_onlineSyncMutex;
+std::vector<std::vector<std::uint8_t>> g_onlineOutgoingFrames;
+WallTransportReassembler g_onlineIncomingMetadata;
 
 TrackingTargetSnapshot currentTrackingTargetSnapshot();
 bool waObjectCurrentTeamMatches(void* owner);
@@ -711,6 +787,10 @@ HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceBltFast(
     DWORD flags);
 HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceFlip(void* surface, void* targetOverride, DWORD flags);
 HRESULT STDMETHODCALLTYPE hookedDirectDrawSurfaceUnlock(void* surface, void* surfaceData);
+int __fastcall hookedWaHostLobbyPacketHandler(void* host, void* edx, int slot, unsigned char* packet, std::size_t size);
+int __fastcall hookedWaClientLobbyPacketHandler(void* client, void* edx, unsigned char* packet, std::size_t size);
+int __stdcall hookedWaConstructLobbyHostScreen(int screen, int arg);
+int __stdcall hookedWaConstructLobbyClientScreen(int screen, int arg);
 HANDLE WINAPI hookedCreateFileA(
     LPCSTR fileName,
     DWORD desiredAccess,
@@ -727,6 +807,9 @@ HANDLE WINAPI hookedCreateFileW(
     DWORD creationDisposition,
     DWORD flagsAndAttributes,
     HANDLE templateFile) noexcept;
+SHORT WINAPI hookedGetAsyncKeyState(int virtualKey) noexcept;
+SHORT WINAPI hookedGetKeyState(int virtualKey) noexcept;
+BOOL WINAPI hookedGetKeyboardState(PBYTE keyState) noexcept;
 
 std::string lowerAscii(std::string value) {
     for (char& ch : value) {
@@ -980,6 +1063,11 @@ std::string wideToActiveCodePage(LPCWSTR value) {
     return output;
 }
 
+bool isOnlineLobbyHostContext();
+void queueOnlineMetadataBroadcastForMap(std::size_t mapIndex);
+void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detectedFileName, bool broadcastOnlineMetadata);
+void clearDirect3D9OverlayMap(const char* reason);
+
 void recordDetectedWaMapFilePath(const std::string& path) {
     if (path.empty() || g_direct3D9OverlayMaps.empty()) {
         return;
@@ -997,19 +1085,29 @@ void recordDetectedWaMapFilePath(const std::string& path) {
     std::size_t metadataMapIndex = 0;
     const bool hasWallMetadata = direct3D9OverlayMapIndexForFileName(path, metadataMapIndex);
     const DWORD now = GetTickCount();
+    bool alreadyDetectedPath = false;
     {
         std::lock_guard<std::mutex> lock(g_detectedMapMutex);
         if (sameAsciiText(g_detectedMapPath, path)) {
             InterlockedExchange(&g_detectedMapTick, static_cast<LONG>(now));
             InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
-            return;
+            alreadyDetectedPath = true;
+        } else {
+            g_detectedMapPath = path;
+            g_detectedMapFileName = fileName;
+            InterlockedExchange(&g_detectedMapTick, static_cast<LONG>(now));
+            InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
+            InterlockedExchange(&g_detectedMapCacheAssociationPending, hasWallMetadata ? 1 : 0);
         }
+    }
 
-        g_detectedMapPath = path;
-        g_detectedMapFileName = fileName;
-        InterlockedExchange(&g_detectedMapTick, static_cast<LONG>(now));
-        InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
-        InterlockedExchange(&g_detectedMapCacheAssociationPending, hasWallMetadata ? 1 : 0);
+    if (alreadyDetectedPath) {
+        if (hasWallMetadata) {
+            activateDirect3D9OverlayMap(metadataMapIndex, fileName, true);
+        } else {
+            clearDirect3D9OverlayMap("detected map has no wall metadata");
+        }
+        return;
     }
 
     InterlockedIncrement(&g_detectedMapSequence);
@@ -1028,6 +1126,12 @@ void recordDetectedWaMapFilePath(const std::string& path) {
                 << ", wall metadata "
                 << (hasWallMetadata ? "yes" : "no");
         g_runtimeProbeLogger->info(message.str());
+    }
+
+    if (hasWallMetadata) {
+        activateDirect3D9OverlayMap(metadataMapIndex, fileName, true);
+    } else {
+        clearDirect3D9OverlayMap("detected map has no wall metadata");
     }
 }
 
@@ -1248,6 +1352,1033 @@ bool tryReadLong(std::uintptr_t address, LONG& value) {
     return true;
 }
 
+void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize);
+
+std::uint16_t readLittleEndian16(const std::uint8_t* data) {
+    return static_cast<std::uint16_t>(data[0])
+        | static_cast<std::uint16_t>(data[1] << 8);
+}
+
+void appendLittleEndian16(std::vector<std::uint8_t>& data, std::uint16_t value) {
+    data.push_back(static_cast<std::uint8_t>(value & 0xFF));
+    data.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+}
+
+std::string makeWallLobbyJsonText(
+    std::uint8_t messageType,
+    const std::uint8_t* payload,
+    std::size_t payloadSize) {
+    const char* messageTypeName = nullptr;
+    switch (messageType) {
+    case kWallLobbyMessageVersionQuery:
+        messageTypeName = "VersionQuery";
+        break;
+    case kWallLobbyMessageVersionInfo:
+        messageTypeName = "VersionInfo";
+        break;
+    case kWallLobbyMessageMetadataFrame:
+        messageTypeName = "MetadataFrame";
+        break;
+    default:
+        return "";
+    }
+
+    std::ostringstream json;
+    json << "{\"module\":\""
+         << kWallLobbyJsonNamespace
+         << "\",\"type\":\""
+         << messageTypeName
+         << "\",\"protocol\":"
+         << kWallProtocolVersion
+         << ",\"transport\":"
+         << kWallTransportVersion;
+
+    if (messageType == kWallLobbyMessageMetadataFrame && payload != nullptr && payloadSize > 0) {
+        static constexpr char kHexDigits[] = "0123456789ABCDEF";
+        json << ",\"data\":\"";
+        for (std::size_t index = 0; index < payloadSize; ++index) {
+            const std::uint8_t value = payload[index];
+            json << kHexDigits[(value >> 4) & 0x0F]
+                 << kHexDigits[value & 0x0F];
+        }
+        json << "\"";
+    }
+
+    json << "}";
+    return json.str();
+}
+
+std::vector<std::uint8_t> makeWallLobbyPacket(
+    std::uint8_t messageType,
+    const std::uint8_t* payload,
+    std::size_t payloadSize) {
+    const std::string text = makeWallLobbyJsonText(messageType, payload, payloadSize);
+    if (text.empty()) {
+        return {};
+    }
+
+    std::vector<std::uint8_t> packet;
+    packet.reserve(sizeof(std::uint16_t) + text.size());
+    appendLittleEndian16(packet, kWallLobbyPacketMagic);
+    packet.insert(packet.end(), text.begin(), text.end());
+    return packet;
+}
+
+std::vector<std::uint8_t> makeWallLobbyChatPacket(std::uint8_t messageType) {
+    const std::string json = makeWallLobbyJsonText(messageType, nullptr, 0);
+    if (json.empty()) {
+        return {};
+    }
+
+    std::string message = "SYS:";
+    message += kWallLobbyJsonNamespace;
+    message += ":ALL:";
+    message += kWallLobbyJsonNamespace;
+    message += ": ";
+    message += json;
+
+    std::vector<std::uint8_t> packet;
+    packet.reserve(sizeof(std::uint16_t) + message.size() + 1);
+    appendLittleEndian16(packet, kWallLobbyChatPacketType);
+    packet.insert(packet.end(), message.begin(), message.end());
+    packet.push_back(0);
+    return packet;
+}
+
+std::vector<std::uint8_t> makeWallLobbyPacket(
+    std::uint8_t messageType,
+    const std::vector<std::uint8_t>& payload) {
+    return makeWallLobbyPacket(messageType, payload.data(), payload.size());
+}
+
+std::size_t findJsonFieldValueStart(const std::string& json, const char* fieldName) {
+    std::string needle = "\"";
+    needle += fieldName;
+    needle += "\"";
+    const std::size_t fieldPosition = json.find(needle);
+    if (fieldPosition == std::string::npos) {
+        return std::string::npos;
+    }
+
+    std::size_t colonPosition = json.find(':', fieldPosition + needle.size());
+    if (colonPosition == std::string::npos) {
+        return std::string::npos;
+    }
+
+    ++colonPosition;
+    while (colonPosition < json.size()
+        && std::isspace(static_cast<unsigned char>(json[colonPosition])) != 0) {
+        ++colonPosition;
+    }
+    return colonPosition;
+}
+
+bool readJsonIntegerField(const std::string& json, const char* fieldName, int& value) {
+    const std::size_t start = findJsonFieldValueStart(json, fieldName);
+    if (start == std::string::npos || start >= json.size()) {
+        return false;
+    }
+
+    std::size_t cursor = start;
+    bool negative = false;
+    if (json[cursor] == '-') {
+        negative = true;
+        ++cursor;
+    }
+    if (cursor >= json.size() || std::isdigit(static_cast<unsigned char>(json[cursor])) == 0) {
+        return false;
+    }
+
+    int parsed = 0;
+    while (cursor < json.size() && std::isdigit(static_cast<unsigned char>(json[cursor])) != 0) {
+        parsed = (parsed * 10) + (json[cursor] - '0');
+        ++cursor;
+    }
+    value = negative ? -parsed : parsed;
+    return true;
+}
+
+bool readJsonStringField(const std::string& json, const char* fieldName, std::string& value) {
+    const std::size_t start = findJsonFieldValueStart(json, fieldName);
+    if (start == std::string::npos || start >= json.size() || json[start] != '"') {
+        return false;
+    }
+
+    value.clear();
+    for (std::size_t cursor = start + 1; cursor < json.size(); ++cursor) {
+        const char ch = json[cursor];
+        if (ch == '"') {
+            return true;
+        }
+        if (ch == '\\') {
+            if (++cursor >= json.size()) {
+                return false;
+            }
+            value.push_back(json[cursor]);
+        } else {
+            value.push_back(ch);
+        }
+    }
+    return false;
+}
+
+int hexValue(char ch) {
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return 10 + (ch - 'a');
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return 10 + (ch - 'A');
+    }
+    return -1;
+}
+
+bool decodeHexPayload(const std::string& hex, std::vector<std::uint8_t>& payload) {
+    if ((hex.size() % 2) != 0) {
+        return false;
+    }
+
+    payload.clear();
+    payload.reserve(hex.size() / 2);
+    for (std::size_t index = 0; index < hex.size(); index += 2) {
+        const int high = hexValue(hex[index]);
+        const int low = hexValue(hex[index + 1]);
+        if (high < 0 || low < 0) {
+            return false;
+        }
+        payload.push_back(static_cast<std::uint8_t>((high << 4) | low));
+    }
+    return true;
+}
+
+bool parseWallLobbyPacket(
+    const unsigned char* packet,
+    std::size_t size,
+    std::uint8_t& messageType,
+    const std::uint8_t*& payload,
+    std::size_t& payloadSize,
+    std::uint16_t& protocolVersion) {
+    payload = nullptr;
+    payloadSize = 0;
+    protocolVersion = 0;
+    if (packet == nullptr || size == 0) {
+        return false;
+    }
+
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(packet);
+    if (size < sizeof(std::uint16_t)) {
+        return false;
+    }
+
+    std::string json;
+    const std::uint16_t packetType = readLittleEndian16(bytes);
+    if (packetType == kWallLobbyPacketMagic) {
+        json.assign(reinterpret_cast<const char*>(bytes + sizeof(std::uint16_t)), size - sizeof(std::uint16_t));
+    } else if (packetType == kWallLobbyChatPacketType) {
+        const char* message = reinterpret_cast<const char*>(bytes + sizeof(std::uint16_t));
+        const std::size_t messageSize = size - sizeof(std::uint16_t);
+        std::string chatText(message, messageSize);
+        const std::size_t terminator = chatText.find('\0');
+        if (terminator != std::string::npos) {
+            chatText.resize(terminator);
+        }
+        const std::size_t jsonStart = chatText.find('{');
+        if (jsonStart == std::string::npos) {
+            return false;
+        }
+        json = chatText.substr(jsonStart);
+    } else {
+        return false;
+    }
+
+    std::size_t start = 0;
+    while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start])) != 0) {
+        ++start;
+    }
+    if (start >= json.size() || json[start] != '{') {
+        return false;
+    }
+
+    std::string module;
+    if (!readJsonStringField(json, "module", module)
+        || module != kWallLobbyJsonNamespace) {
+        return false;
+    }
+
+    std::string type;
+    if (!readJsonStringField(json, "type", type)) {
+        return false;
+    }
+
+    int parsedProtocolVersion = 0;
+    if (!readJsonIntegerField(json, "protocol", parsedProtocolVersion)) {
+        return false;
+    }
+    protocolVersion = static_cast<std::uint16_t>(parsedProtocolVersion);
+
+    static thread_local std::vector<std::uint8_t> parsedPayload;
+    parsedPayload.clear();
+
+    if (type == "query" || type == "VersionQuery") {
+        messageType = kWallLobbyMessageVersionQuery;
+    } else if (type == "version" || type == "VersionInfo") {
+        int transportVersion = 0;
+        if (!readJsonIntegerField(json, "transport", transportVersion)) {
+            return false;
+        }
+        messageType = kWallLobbyMessageVersionInfo;
+        appendLittleEndian16(parsedPayload, protocolVersion);
+        appendLittleEndian16(parsedPayload, static_cast<std::uint16_t>(transportVersion));
+    } else if (type == "metadata" || type == "MetadataFrame") {
+        std::string data;
+        if (!readJsonStringField(json, "data", data)
+            || !decodeHexPayload(data, parsedPayload)) {
+            return false;
+        }
+        messageType = kWallLobbyMessageMetadataFrame;
+    } else {
+        return false;
+    }
+
+    payload = parsedPayload.empty() ? nullptr : parsedPayload.data();
+    payloadSize = parsedPayload.size();
+    return true;
+}
+
+std::string describeWallLobbyVersionInfo(const std::uint8_t* payload, std::size_t payloadSize) {
+    if (payload == nullptr || payloadSize < 4) {
+        return "invalid version payload";
+    }
+
+    std::ostringstream message;
+    message << "protocol "
+            << readLittleEndian16(payload)
+            << ", transport "
+            << readLittleEndian16(payload + 2);
+    return message.str();
+}
+
+bool isOnlineLobbyHost() {
+    LONG value = 0;
+    return g_lobbyHostSlotAddress != 0
+        && tryReadLong(g_lobbyHostSlotAddress + 12, value)
+        && value != 0;
+}
+
+bool isOnlineLobbyHostContext() {
+    return g_lobbyHostScreenAddress != 0 && isOnlineLobbyHost();
+}
+
+bool isOnlineLobbyClient() {
+    LONG value = 0;
+    return g_lobbyClientSlotAddress != 0
+        && tryReadLong(g_lobbyClientSlotAddress + 0xB8, value)
+        && value == 3;
+}
+
+int onlineLobbyHostSlotCount() {
+    if (!isOnlineLobbyHost()) {
+        return 0;
+    }
+
+    if (g_lobbyHostIncomingConnectionAddress != 0
+        && isReadableMemoryRange(g_lobbyHostIncomingConnectionAddress + 0x28, sizeof(std::uint8_t))) {
+        const int slots = *reinterpret_cast<const std::uint8_t*>(g_lobbyHostIncomingConnectionAddress + 0x28);
+        if (slots > 0 && slots <= 6) {
+            return slots;
+        }
+    }
+
+    return 1;
+}
+
+std::uintptr_t onlineLobbyHostSlotsBase() {
+    if (!isOnlineLobbyHost()) {
+        return 0;
+    }
+
+    const int slotCount = onlineLobbyHostSlotCount();
+    if (slotCount != 6
+        && g_lobbyHostIncomingConnectionAddress != 0
+        && isReadableMemoryRange(g_lobbyHostIncomingConnectionAddress + 0xB, sizeof(std::uintptr_t))) {
+        std::uintptr_t hostSlots = 0;
+        std::memcpy(
+            &hostSlots,
+            reinterpret_cast<const void*>(g_lobbyHostIncomingConnectionAddress + 0xB),
+            sizeof(hostSlots));
+        if (hostSlots != 0) {
+            return hostSlots;
+        }
+    }
+
+    return g_lobbyHostSlotAddress;
+}
+
+std::uintptr_t onlineLobbyHostSlotAddressFromBase(std::uintptr_t hostSlots, int slot) {
+    if (hostSlots == 0 || slot < 0 || slot >= 31) {
+        return 0;
+    }
+
+    return hostSlots
+        + kWaHostSlotDataOffset
+        + (static_cast<std::uintptr_t>(slot) * kWaHostSlotStride);
+}
+
+bool onlineLobbyHostSlotConnected(int slot) {
+    if (slot < 0 || slot >= 31) {
+        return false;
+    }
+
+    const std::uintptr_t hostSlots = onlineLobbyHostSlotsBase();
+    if (hostSlots == 0) {
+        return false;
+    }
+
+    LONG state = 0;
+    const std::uintptr_t slotAddress = onlineLobbyHostSlotAddressFromBase(hostSlots, slot);
+    const std::uintptr_t stateAddress = slotAddress + kWaHostSlotConnectionStateOffset;
+    return tryReadLong(stateAddress, state) && state == kWaHostSlotConnectedState;
+}
+
+std::uint32_t onlineLobbyConnectedSlotMask() {
+    std::uint32_t mask = 0;
+    const int slotCount = onlineLobbyHostSlotCount();
+    for (int slot = 0; slot < slotCount && slot < 31; ++slot) {
+        if (onlineLobbyHostSlotConnected(slot)) {
+            mask |= (1u << slot);
+        }
+    }
+    return mask;
+}
+
+std::uint32_t refreshOnlineLobbyConnectedSlots() {
+    const std::uint32_t connected = onlineLobbyConnectedSlotMask();
+    const LONG previous = g_onlineLobbyLastConnectedSlotMask;
+    const LONG disconnected =
+        previous & ~static_cast<LONG>(connected);
+
+    if (disconnected != 0) {
+        InterlockedAnd(&g_onlineLobbySeenSlotMask, ~disconnected);
+        InterlockedAnd(&g_onlineLobbyCompatibleSlotMask, ~disconnected);
+        InterlockedAnd(&g_onlineLobbyBroadcastSlotMask, ~disconnected);
+        InterlockedAnd(&g_onlineLobbyQuerySlotMask, ~disconnected);
+    }
+
+    InterlockedExchange(&g_onlineLobbyLastConnectedSlotMask, static_cast<LONG>(connected));
+    return connected;
+}
+
+bool tryReadLobbyAsciiString(std::uintptr_t address, std::string& value) {
+    value.clear();
+    if (address == 0 || !isReadableMemoryRange(address, 1)) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < 31; ++index) {
+        if (!isReadableMemoryRange(address + index, 1)) {
+            return false;
+        }
+
+        const unsigned char ch = *reinterpret_cast<const unsigned char*>(address + index);
+        if (ch == '\0') {
+            break;
+        }
+
+        if (ch < 0x20 || ch == 0x7F) {
+            value.clear();
+            return false;
+        }
+
+        value.push_back(static_cast<char>(ch));
+    }
+
+    while (!value.empty() && value.back() == ' ') {
+        value.pop_back();
+    }
+    return !value.empty();
+}
+
+std::string onlineLobbySlotName(int slot) {
+    const std::uintptr_t hostSlots = onlineLobbyHostSlotsBase();
+    if (hostSlots != 0 && slot >= 0 && slot < 31) {
+        const std::uintptr_t slotAddress = onlineLobbyHostSlotAddressFromBase(hostSlots, slot);
+        const std::uintptr_t compactSlotAddress = hostSlots
+            + (static_cast<std::uintptr_t>(slot) * kWaHostSlotStride);
+        const std::uintptr_t legacySlotAddress = g_lobbyHostSlotAddress
+            + kWaHostSlotDataOffset
+            + (static_cast<std::uintptr_t>(slot) * kWaHostSlotStride);
+        const std::array<std::uintptr_t, 5> candidateAddresses = {
+            slotAddress + kWaHostSlotNicknameOffset,
+            compactSlotAddress + kWaHostSlotNicknameOffset,
+            compactSlotAddress + kWaHostSlotDataOffset + kWaHostSlotNicknameOffset,
+            legacySlotAddress + kWaHostSlotNicknameOffset,
+            legacySlotAddress,
+        };
+
+        std::string name;
+        for (std::uintptr_t candidate : candidateAddresses) {
+            if (tryReadLobbyAsciiString(candidate, name)) {
+                return name;
+            }
+        }
+
+        if (g_runtimeProbeLogger != nullptr && g_onlineLobbyMessageLogCount < 24) {
+            InterlockedIncrement(&g_onlineLobbyMessageLogCount);
+            std::ostringstream message;
+            message << "online lobby sync: failed to resolve nickname for slot "
+                    << slot
+                    << ", hostSlots "
+                    << formatAddress(hostSlots)
+                    << ", slotAddress "
+                    << formatAddress(slotAddress);
+            g_runtimeProbeLogger->info(message.str());
+        }
+    }
+
+    std::ostringstream fallback;
+    fallback << "slot " << slot;
+    return fallback.str();
+}
+
+std::string describeOnlineLobbySlotMask(std::uint32_t mask) {
+    std::ostringstream message;
+    bool first = true;
+    for (int slot = 0; slot < 31; ++slot) {
+        if ((mask & (1u << slot)) == 0) {
+            continue;
+        }
+
+        if (!first) {
+            message << ", ";
+        }
+        first = false;
+        message << onlineLobbySlotName(slot);
+    }
+
+    if (first) {
+        return "none";
+    }
+    return message.str();
+}
+
+void wallLobbyPrint(const std::string& message) {
+    if (g_waLobbyDisplayMessage == nullptr || message.empty()) {
+        return;
+    }
+
+    std::uintptr_t screen = 0;
+    if (isOnlineLobbyClient() && g_lobbyClientScreenAddress != 0) {
+        screen = g_lobbyClientScreenAddress;
+    } else if (isOnlineLobbyHostContext()) {
+        screen = g_lobbyHostScreenAddress;
+    }
+
+    if (screen == 0 || !isReadableMemoryRange(screen + 0x10318, sizeof(void*))) {
+        return;
+    }
+
+    std::string formatted = "SYS:wkWall2Wall:ALL:wkWall2Wall: ";
+    formatted += message;
+    g_waLobbyDisplayMessage(
+        static_cast<int>(screen + 0x10318),
+        const_cast<char*>(formatted.c_str()));
+}
+
+bool wallLobbyVersionPayloadCompatible(
+    std::uint16_t protocolVersion,
+    const std::uint8_t* payload,
+    std::size_t payloadSize) {
+    return protocolVersion == kWallProtocolVersion
+        && payload != nullptr
+        && payloadSize >= 4
+        && readLittleEndian16(payload) == kWallProtocolVersion
+        && readLittleEndian16(payload + 2) == kWallTransportVersion;
+}
+
+void resetOnlineLobbyCompatibilityState(DWORD now) {
+    const std::uint32_t connected = refreshOnlineLobbyConnectedSlots();
+    InterlockedExchange(&g_onlineLobbySeenSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyCompatibleSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyBroadcastSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyQuerySlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyLastConnectedSlotMask, static_cast<LONG>(connected));
+    InterlockedExchange(
+        &g_onlineLobbyCompatibilityDeadlineTick,
+        static_cast<LONG>(now + kOnlineLobbyCompatibilityTimeoutMilliseconds));
+    InterlockedExchange(&g_onlineLobbyCompatibilityReported, 0);
+}
+
+bool onlineLobbyTickReached(DWORD tick) {
+    return tick != 0 && static_cast<LONG>(GetTickCount() - tick) >= 0;
+}
+
+void reportOnlineLobbyCompatibilityStatus(bool force) {
+    if (!g_onlineSyncEnabled || !isOnlineLobbyHostContext()) {
+        return;
+    }
+
+    const DWORD deadline = static_cast<DWORD>(g_onlineLobbyCompatibilityDeadlineTick);
+    const bool deadlineReached = onlineLobbyTickReached(deadline);
+
+    const std::uint32_t connected = refreshOnlineLobbyConnectedSlots();
+    if (connected == 0) {
+        return;
+    }
+
+    const std::uint32_t seen = static_cast<std::uint32_t>(g_onlineLobbySeenSlotMask);
+    const std::uint32_t compatible = static_cast<std::uint32_t>(g_onlineLobbyCompatibleSlotMask);
+    const std::uint32_t missing = connected & ~seen;
+    const std::uint32_t incompatible = connected & seen & ~compatible;
+    const bool allCompatible = missing == 0 && incompatible == 0;
+
+    if (!allCompatible && !force && !deadlineReached) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_onlineLobbyCompatibilityReported, 1, 0) != 0 && !allCompatible) {
+        return;
+    }
+
+    if (allCompatible) {
+        wallLobbyPrint("all connected players have a compatible wkWall2Wall.");
+        return;
+    }
+
+    std::ostringstream message;
+    if (missing != 0) {
+        message << "missing wkWall2Wall response from: "
+                << describeOnlineLobbySlotMask(missing);
+    }
+    if (incompatible != 0) {
+        if (missing != 0) {
+            message << "; ";
+        }
+        message << "incompatible wkWall2Wall version from: "
+                << describeOnlineLobbySlotMask(incompatible);
+    }
+    wallLobbyPrint(message.str());
+}
+
+void checkOnlineLobbyCompatibilityTimeout() {
+    const DWORD deadline = static_cast<DWORD>(g_onlineLobbyCompatibilityDeadlineTick);
+    if (deadline == 0 || g_onlineLobbyCompatibilityReported != 0) {
+        return;
+    }
+
+    if (onlineLobbyTickReached(deadline)) {
+        reportOnlineLobbyCompatibilityStatus(true);
+    }
+}
+
+bool onlineLobbySlotHasCompatibleVersion(int slot) {
+    if (slot < 0 || slot >= 31) {
+        return false;
+    }
+
+    const std::uint32_t slotMask = 1u << slot;
+    const std::uint32_t seen = static_cast<std::uint32_t>(g_onlineLobbySeenSlotMask);
+    const std::uint32_t compatible = static_cast<std::uint32_t>(g_onlineLobbyCompatibleSlotMask);
+    return (seen & slotMask) != 0 && (compatible & slotMask) != 0;
+}
+
+bool onlineLobbyCompatibilityCompleteForCurrentPlayers() {
+    if (!g_onlineSyncEnabled || !g_onlineRequireAllPlayers || !isOnlineLobbyHostContext()) {
+        return true;
+    }
+
+    const std::uint32_t connected = refreshOnlineLobbyConnectedSlots();
+    if (connected == 0) {
+        return true;
+    }
+
+    const std::uint32_t seen = static_cast<std::uint32_t>(g_onlineLobbySeenSlotMask);
+    const std::uint32_t compatible = static_cast<std::uint32_t>(g_onlineLobbyCompatibleSlotMask);
+    return (connected & ~seen) == 0 && (connected & seen & ~compatible) == 0;
+}
+
+bool onlineWallModuleAllowedForCurrentContext() {
+    if (!g_onlineSyncEnabled || !g_onlineRequireAllPlayers || !isOnlineLobbyHostContext()) {
+        return true;
+    }
+
+    if (refreshOnlineLobbyConnectedSlots() == 0) {
+        return true;
+    }
+
+    return onlineLobbyCompatibilityCompleteForCurrentPlayers();
+}
+
+bool sendWallLobbyPacketToClientSlot(int slot, const std::vector<std::uint8_t>& packet) {
+    if (packet.empty()
+        || g_lobbyHostUnicastAddress == 0
+        || g_lobbyHostSlotAddress == 0
+        || !isOnlineLobbyHostContext()) {
+        return false;
+    }
+
+    const char* packetData = reinterpret_cast<const char*>(packet.data());
+    const std::size_t packetSize = packet.size();
+    const std::uintptr_t hostSlot = g_lobbyHostSlotAddress;
+    const std::uintptr_t hostUnicast = g_lobbyHostUnicastAddress;
+    int result = 0;
+
+#if defined(__i386__) || defined(_M_IX86)
+    // Load register arguments before pushing the stack argument. GCC may address
+    // local operands relative to ESP, so a preceding push would shift them.
+    asm volatile(
+        "movl %[packetData], %%esi\n\t"
+        "movl %[slot], %%ecx\n\t"
+        "movl %[packetSize], %%edx\n\t"
+        "pushl %[hostSlot]\n\t"
+        "call *%[hostUnicast]\n\t"
+        : "=a"(result)
+        : [hostUnicast] "r"(hostUnicast),
+          [hostSlot] "m"(hostSlot),
+          [packetData] "m"(packetData),
+          [slot] "m"(slot),
+          [packetSize] "m"(packetSize)
+        : "ecx", "edx", "esi", "memory", "cc");
+#else
+    (void)slot;
+    (void)packetData;
+    (void)packetSize;
+    (void)hostSlot;
+    (void)hostUnicast;
+#endif
+
+    return result != 0;
+}
+
+bool sendWallLobbyPacketToHost(const std::vector<std::uint8_t>& packet) {
+    if (packet.empty()
+        || g_lobbyClientSlotAddress == 0
+        || !isOnlineLobbyClient()
+        || !isReadableMemoryRange(g_lobbyClientSlotAddress, sizeof(std::uintptr_t))) {
+        return false;
+    }
+
+    const std::uintptr_t vtable = *reinterpret_cast<std::uintptr_t*>(g_lobbyClientSlotAddress);
+    if (!isReadableMemoryRange(vtable + 52, sizeof(std::uintptr_t))) {
+        return false;
+    }
+
+    const auto sendFunction =
+        reinterpret_cast<WaClientSendPacketFunction>(*reinterpret_cast<std::uintptr_t*>(vtable + 52));
+    if (sendFunction == nullptr) {
+        return false;
+    }
+
+    return sendFunction(
+        reinterpret_cast<void*>(g_lobbyClientSlotAddress),
+        const_cast<unsigned char*>(packet.data()),
+        packet.size()) != 0;
+}
+
+void sendWallLobbyVersionInfoToHost() {
+    sendWallLobbyPacketToHost(makeWallLobbyChatPacket(kWallLobbyMessageVersionInfo));
+}
+
+bool sendWallLobbyVersionQueryToClientSlot(int slot) {
+    if (slot < 0 || slot >= 31) {
+        return false;
+    }
+
+    const LONG slotMask = 1L << slot;
+    const LONG previous = InterlockedOr(&g_onlineLobbyQuerySlotMask, slotMask);
+    if ((previous & slotMask) != 0) {
+        return false;
+    }
+
+    const bool sent =
+        sendWallLobbyPacketToClientSlot(slot, makeWallLobbyChatPacket(kWallLobbyMessageVersionQuery));
+    if (!sent) {
+        InterlockedAnd(&g_onlineLobbyQuerySlotMask, ~slotMask);
+    }
+    return sent;
+}
+
+void broadcastWallLobbyVersionQuery() {
+    const int slotCount = onlineLobbyHostSlotCount();
+    const std::uint32_t connected = refreshOnlineLobbyConnectedSlots();
+    for (int slot = 0; slot < slotCount && slot < 31; ++slot) {
+        if ((connected & (1u << slot)) != 0) {
+            sendWallLobbyVersionQueryToClientSlot(slot);
+        }
+    }
+}
+
+bool sendQueuedOnlineMetadataToLobbySlot(
+    int slot,
+    const std::vector<std::vector<std::uint8_t>>& frames) {
+    if (!kOnlineLobbyHostUnicastEnabled
+        || frames.empty()
+        || !onlineLobbySlotHasCompatibleVersion(slot)) {
+        return false;
+    }
+
+    bool sentAny = false;
+    for (const std::vector<std::uint8_t>& frame : frames) {
+        sentAny = sendWallLobbyPacketToClientSlot(
+            slot,
+            makeWallLobbyPacket(kWallLobbyMessageMetadataFrame, frame)) || sentAny;
+    }
+
+    if (sentAny && slot >= 0 && slot < 31) {
+        InterlockedOr(&g_onlineLobbyBroadcastSlotMask, 1L << slot);
+    }
+    return sentAny;
+}
+
+int sendQueuedOnlineMetadataToCompatibleLobbySlots(
+    const std::vector<std::vector<std::uint8_t>>& frames) {
+    if (frames.empty()
+        || !isOnlineLobbyHostContext()
+        || (g_onlineRequireAllPlayers && !onlineLobbyCompatibilityCompleteForCurrentPlayers())) {
+        return 0;
+    }
+
+    const int slotCount = onlineLobbyHostSlotCount();
+    const std::uint32_t connected = refreshOnlineLobbyConnectedSlots();
+    const std::uint32_t compatible = static_cast<std::uint32_t>(g_onlineLobbyCompatibleSlotMask);
+    int sentSlots = 0;
+    for (int slot = 0; slot < slotCount && slot < 31; ++slot) {
+        const std::uint32_t slotMask = 1u << slot;
+        if ((connected & slotMask) == 0 || (compatible & slotMask) == 0) {
+            continue;
+        }
+        if ((g_onlineLobbyBroadcastSlotMask & static_cast<LONG>(slotMask)) != 0) {
+            continue;
+        }
+        if (sendQueuedOnlineMetadataToLobbySlot(slot, frames)) {
+            ++sentSlots;
+        }
+    }
+    return sentSlots;
+}
+
+void broadcastQueuedOnlineMetadataToLobby() {
+    if (!g_onlineSyncEnabled || !isOnlineLobbyHostContext()) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    const LONG lastTick = g_onlineLobbyLastBroadcastTick;
+    if (lastTick != 0
+        && now - static_cast<DWORD>(lastTick) < kOnlineLobbyBroadcastCooldownMilliseconds) {
+        return;
+    }
+
+    std::vector<std::vector<std::uint8_t>> frames;
+    {
+        std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+        frames = g_onlineOutgoingFrames;
+    }
+
+    if (frames.empty()) {
+        return;
+    }
+
+    if (refreshOnlineLobbyConnectedSlots() == 0) {
+        return;
+    }
+
+    InterlockedExchange(&g_onlineLobbyLastBroadcastTick, static_cast<LONG>(now));
+
+    if (!kOnlineLobbyHostUnicastEnabled) {
+        wallLobbyPrint("wall metadata loaded; online compatibility handshake is paused in this build.");
+        if (g_runtimeProbeLogger != nullptr && g_onlineLobbyMessageLogCount < 24) {
+            InterlockedIncrement(&g_onlineLobbyMessageLogCount);
+            g_runtimeProbeLogger->info("online lobby sync: host unicast disabled; skipped binary lobby compatibility packets");
+        }
+        return;
+    }
+
+    resetOnlineLobbyCompatibilityState(now);
+    wallLobbyPrint("wall metadata loaded; checking wkWall2Wall clients.");
+    broadcastWallLobbyVersionQuery();
+    const int sentSlots = sendQueuedOnlineMetadataToCompatibleLobbySlots(frames);
+
+    if (g_runtimeProbeLogger != nullptr && g_onlineLobbyMessageLogCount < 24) {
+        InterlockedIncrement(&g_onlineLobbyMessageLogCount);
+        std::ostringstream log;
+        log << "online lobby sync: sent chat compatibility query and prepared "
+            << frames.size()
+            << " metadata frame(s)";
+        if (sentSlots > 0) {
+            log << "; sent to " << sentSlots << " compatible slot(s)";
+        } else {
+            log << "; waiting for compatible client responses";
+        }
+        g_runtimeProbeLogger->info(log.str());
+    }
+}
+
+bool hasQueuedOnlineMetadataFrames() {
+    std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+    return !g_onlineOutgoingFrames.empty();
+}
+
+void maybeBroadcastQueuedOnlineMetadataForLobbySlot(int slot) {
+    if (!g_onlineSyncEnabled
+        || slot < 0
+        || slot >= 31
+        || !isOnlineLobbyHostContext()
+        || !hasQueuedOnlineMetadataFrames()) {
+        return;
+    }
+
+    if (!kOnlineLobbyHostUnicastEnabled) {
+        return;
+    }
+
+    const std::uint32_t connected = refreshOnlineLobbyConnectedSlots();
+    if ((connected & (1u << slot)) == 0) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    const LONG lastTick = g_onlineLobbyLastBroadcastTick;
+    if (lastTick != 0
+        && now - static_cast<DWORD>(lastTick) < kOnlineLobbyBroadcastCooldownMilliseconds) {
+        return;
+    }
+
+    bool sentSomething = false;
+
+    if (!onlineLobbySlotHasCompatibleVersion(slot)) {
+        sentSomething = sendWallLobbyVersionQueryToClientSlot(slot);
+        if (sentSomething) {
+            InterlockedExchange(
+                &g_onlineLobbyCompatibilityDeadlineTick,
+                static_cast<LONG>(now + kOnlineLobbyCompatibilityTimeoutMilliseconds));
+            InterlockedExchange(&g_onlineLobbyCompatibilityReported, 0);
+        }
+    } else {
+        std::vector<std::vector<std::uint8_t>> frames;
+        {
+            std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+            frames = g_onlineOutgoingFrames;
+        }
+        sentSomething = sendQueuedOnlineMetadataToCompatibleLobbySlots(frames) > 0;
+    }
+
+    if (!sentSomething) {
+        return;
+    }
+
+    InterlockedExchange(&g_onlineLobbyLastBroadcastTick, static_cast<LONG>(now));
+
+    if (g_runtimeProbeLogger != nullptr && g_onlineLobbyMessageLogCount < 24) {
+        InterlockedIncrement(&g_onlineLobbyMessageLogCount);
+        std::ostringstream message;
+        message << "online lobby sync: refreshed compatibility check after activity from "
+                << onlineLobbySlotName(slot);
+        g_runtimeProbeLogger->info(message.str());
+    }
+}
+
+void handleWallLobbyPacketAsHost(
+    int slot,
+    std::uint8_t messageType,
+    std::uint16_t protocolVersion,
+    const std::uint8_t* payload,
+    std::size_t payloadSize) {
+    if (messageType == kWallLobbyMessageVersionInfo) {
+        const LONG slotMask = (slot >= 0 && slot < 31) ? (1L << slot) : 0;
+        const bool compatible = wallLobbyVersionPayloadCompatible(protocolVersion, payload, payloadSize);
+        if (slotMask != 0) {
+            InterlockedOr(&g_onlineLobbySeenSlotMask, slotMask);
+            if (compatible) {
+                InterlockedOr(&g_onlineLobbyCompatibleSlotMask, slotMask);
+            } else {
+                InterlockedAnd(&g_onlineLobbyCompatibleSlotMask, ~slotMask);
+            }
+            InterlockedExchange(&g_onlineLobbyCompatibilityReported, 0);
+        }
+
+        std::ostringstream message;
+        message << onlineLobbySlotName(slot)
+                << " has wkWall2Wall "
+                << describeWallLobbyVersionInfo(payload, payloadSize);
+        if (!compatible) {
+            message << " (incompatible)";
+        }
+        if (protocolVersion != kWallProtocolVersion) {
+            message << " (lobby header protocol " << protocolVersion << ")";
+        }
+        wallLobbyPrint(message.str());
+        if (g_runtimeProbeLogger != nullptr && g_onlineLobbyPacketLogCount < 48) {
+            InterlockedIncrement(&g_onlineLobbyPacketLogCount);
+            g_runtimeProbeLogger->info("online lobby sync: " + message.str());
+        }
+        if (compatible && hasQueuedOnlineMetadataFrames()) {
+            std::vector<std::vector<std::uint8_t>> frames;
+            {
+                std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+                frames = g_onlineOutgoingFrames;
+            }
+            const int sentSlots = sendQueuedOnlineMetadataToCompatibleLobbySlots(frames);
+            if (sentSlots > 0 && g_runtimeProbeLogger != nullptr && g_onlineLobbyMessageLogCount < 24) {
+                InterlockedIncrement(&g_onlineLobbyMessageLogCount);
+                std::ostringstream log;
+                log << "online lobby sync: sent queued metadata to "
+                    << sentSlots
+                    << " compatible slot(s) after version response";
+                g_runtimeProbeLogger->info(log.str());
+            }
+        }
+        reportOnlineLobbyCompatibilityStatus(false);
+        return;
+    }
+
+    if (g_runtimeProbeLogger != nullptr && g_onlineLobbyPacketLogCount < 48) {
+        InterlockedIncrement(&g_onlineLobbyPacketLogCount);
+        std::ostringstream message;
+        message << "online lobby sync: host ignored message type "
+                << static_cast<int>(messageType)
+                << " from slot "
+                << slot;
+        g_runtimeProbeLogger->info(message.str());
+    }
+}
+
+void handleWallLobbyPacketAsClient(
+    std::uint8_t messageType,
+    std::uint16_t protocolVersion,
+    const std::uint8_t* payload,
+    std::size_t payloadSize) {
+    if (protocolVersion != kWallProtocolVersion) {
+        std::ostringstream message;
+        message << "host wkWall2Wall protocol mismatch: host "
+                << protocolVersion
+                << ", local "
+                << kWallProtocolVersion;
+        wallLobbyPrint(message.str());
+        if (g_runtimeProbeLogger != nullptr && g_onlineLobbyPacketLogCount < 48) {
+            InterlockedIncrement(&g_onlineLobbyPacketLogCount);
+            g_runtimeProbeLogger->warn("online lobby sync: " + message.str());
+        }
+        return;
+    }
+
+    if (messageType == kWallLobbyMessageVersionQuery) {
+        sendWallLobbyVersionInfoToHost();
+        wallLobbyPrint("host requested wkWall2Wall compatibility check.");
+        return;
+    }
+
+    if (messageType == kWallLobbyMessageMetadataFrame) {
+        handleIncomingOnlineMetadataFrame(payload, payloadSize);
+        return;
+    }
+
+    if (messageType == kWallLobbyMessageVersionInfo) {
+        wallLobbyPrint("host has wkWall2Wall " + describeWallLobbyVersionInfo(payload, payloadSize));
+    }
+}
+
 LONG readWaObjectLong(void* owner, std::uintptr_t offset) {
     if (owner == nullptr) {
         return 0;
@@ -1265,6 +2396,8 @@ void resetCollisionDiagnosticLogWindows();
 
 const char* waTaskMessageName(std::uint32_t messageType) {
     switch (messageType) {
+    case kWallGameTaskMessageMetadataFrame:
+        return "Wall2WallMetadataFrame";
     case 7:
         return "CrateCollected";
     case 49:
@@ -1294,6 +2427,7 @@ const char* waTaskMessageName(std::uint32_t messageType) {
 
 bool waTaskMessageLooksTurnRelated(std::uint32_t messageType) {
     switch (messageType) {
+    case kWallGameTaskMessageMetadataFrame:
     case 7:
     case 49:
     case 52:
@@ -1322,6 +2456,10 @@ enum class AttackBlockReason {
     RopeRequired,
 };
 
+bool ownerKindLooksLikeRopeContext(LONG ownerKind);
+void noteRecentRopeContext(LONG ownerKind);
+bool recentRopeContextActive();
+
 LONG readTurnGameLong(void* turnGame, std::uintptr_t offset) {
     if (turnGame == nullptr) {
         return 0;
@@ -1340,7 +2478,9 @@ void logTurnGameMessageProbe(
     std::size_t dataSize,
     void* data,
     int result) {
-    if (g_runtimeProbeLogger == nullptr || !waTaskMessageLooksTurnRelated(messageType)) {
+    if (!kVerboseRuntimeDiagnostics
+        || g_runtimeProbeLogger == nullptr
+        || !waTaskMessageLooksTurnRelated(messageType)) {
         return;
     }
 
@@ -1547,9 +2687,93 @@ std::size_t touchedOverlayWallCount() {
     return count;
 }
 
+void noteWallGameplayTaskActivity() {
+    InterlockedExchange(&g_wallGameplayTaskActive, 1);
+    InterlockedExchange(&g_wallGameplayTaskLastTick, static_cast<LONG>(GetTickCount()));
+}
+
+void resetWallGameplayTaskActivity() {
+    InterlockedExchange(&g_wallGameplayTaskActive, 0);
+    InterlockedExchange(&g_wallGameplayTaskLastTick, 0);
+}
+
+bool wallOverlayMetadataActive() {
+    return g_direct3D9ActiveOverlayMapIndex >= 0
+        && !g_direct3D9OverlayTestRects.empty();
+}
+
+bool wallRuntimeHooksShouldProcessFast() {
+    return g_wallGameplayTaskActive != 0
+        && wallOverlayMetadataActive();
+}
+
+bool activeOverlayMapTrustedByOnlineMetadata(LONG activeIndex) {
+    return activeIndex >= 0 && g_onlineMetadataTrustedOverlayMapIndex == activeIndex;
+}
+
+void trustActiveOverlayMapForOnlineMetadata(std::size_t mapIndex) {
+    if (mapIndex > static_cast<std::size_t>(std::numeric_limits<LONG>::max())) {
+        return;
+    }
+
+    InterlockedExchange(
+        &g_onlineMetadataTrustedOverlayMapIndex,
+        static_cast<LONG>(mapIndex));
+}
+
+void clearOnlineMetadataTrust() {
+    InterlockedExchange(&g_onlineMetadataTrustedOverlayMapIndex, -1);
+}
+
+bool activeOverlayMapStillMatchesDetectedMap() {
+    const LONG activeIndex = g_direct3D9ActiveOverlayMapIndex;
+    if (activeIndex < 0 || static_cast<std::size_t>(activeIndex) >= g_direct3D9OverlayMaps.size()) {
+        return false;
+    }
+
+    if (activeOverlayMapTrustedByOnlineMetadata(activeIndex)) {
+        return true;
+    }
+
+    std::string detectedPath;
+    std::string detectedFileName;
+    {
+        std::lock_guard<std::mutex> lock(g_detectedMapMutex);
+        detectedPath = g_detectedMapPath;
+        detectedFileName = g_detectedMapFileName;
+    }
+
+    if (detectedPath.empty() || detectedFileName.empty()) {
+        return false;
+    }
+
+    const WaOverlayMap& activeMap = g_direct3D9OverlayMaps[static_cast<std::size_t>(activeIndex)];
+    return sameFileName(activeMap.fileName, detectedFileName)
+        || sameFileName(activeMap.fileName, detectedPath);
+}
+
+bool wallGameplayRulesActiveForCurrentMap() {
+    const DWORD lastRendererGameplayTick =
+        static_cast<DWORD>(g_direct3D9OverlayLastGameplayEvidenceTick);
+    const bool recentRendererGameplayEvidence =
+        g_direct3D9OverlayGameplayActive != 0
+        && lastRendererGameplayTick != 0
+        && GetTickCount() - lastRendererGameplayTick <= 1500;
+
+    return g_wallGameplayTaskActive != 0
+        && recentRendererGameplayEvidence
+        && wallOverlayMetadataActive()
+        && activeOverlayMapStillMatchesDetectedMap();
+}
+
 AttackBlockReason currentAttackBlockReason() {
+    if (!onlineWallModuleAllowedForCurrentContext()
+        || !wallGameplayRulesActiveForCurrentMap()) {
+        return AttackBlockReason::None;
+    }
+
     const std::size_t totalWalls = g_direct3D9OverlayTestRects.size();
-    if (g_direct3D9ActiveOverlayMapIndex < 0 || totalWalls == 0) {
+    if (totalWalls == 0) {
         return AttackBlockReason::None;
     }
 
@@ -1565,8 +2789,8 @@ AttackBlockReason currentAttackBlockReason() {
 }
 
 bool attackRulesApplyToCurrentMap() {
-    return g_direct3D9ActiveOverlayMapIndex >= 0
-        && !g_direct3D9OverlayTestRects.empty();
+    return onlineWallModuleAllowedForCurrentContext()
+        && wallGameplayRulesActiveForCurrentMap();
 }
 
 const char* attackBlockReasonName(AttackBlockReason reason) {
@@ -1911,6 +3135,7 @@ void clearActiveWormCandidateForTurnChange() {
     InterlockedExchange(&g_activeWormCandidateSourceKind, 0);
     InterlockedExchange(&g_activeWormCandidateSourceOffset, 0);
     InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
+    InterlockedExchange(&g_recentRopeContextTick, 0);
     InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
     InterlockedExchange(&g_wallTouchLastTouchTick, 0);
     resetCollisionDiagnosticLogWindows();
@@ -1925,6 +3150,7 @@ void clearActiveWormCoordinateCandidateForReselection() {
     InterlockedExchange(&g_activeWormCandidateSourceKind, 0);
     InterlockedExchange(&g_activeWormCandidateSourceOffset, 0);
     InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
+    InterlockedExchange(&g_recentRopeContextTick, 0);
 }
 
 void resetCollisionQueryCommonLogWindow() {
@@ -1948,6 +3174,11 @@ bool markTouchedOverlayWallFromPhysics(
     int ownerY,
     int distancePixels,
     const char* method) {
+    if (!onlineWallModuleAllowedForCurrentContext()
+        || !wallGameplayRulesActiveForCurrentMap()) {
+        return false;
+    }
+
     const DWORD now = GetTickCount();
     for (Direct3D9OverlayRect& rect : g_direct3D9OverlayTestRects) {
         if (rect.wallIndex != wallIndex) {
@@ -2190,6 +3421,7 @@ void resetTransientGameplayTrackingState(const char* reason, bool clearWormSampl
     InterlockedExchange(&g_activeWormCandidateLastYFixed, 0);
     InterlockedExchange(&g_activeWormCandidateRefreshTick, 0);
     InterlockedExchange(&g_activeWormCandidateScanTick, 0);
+    InterlockedExchange(&g_recentRopeContextTick, 0);
     InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
     InterlockedExchange(&g_wallTouchLastTouchTick, 0);
     InterlockedExchange(&g_wallTouchLastResetTick, 0);
@@ -2399,7 +3631,8 @@ bool publishActiveWormCandidateFromLiveSample(const WormLiveSample& sample, cons
         4,
         xOffset);
 
-    if (g_runtimeProbeLogger != nullptr
+    if (kVerboseRuntimeDiagnostics
+        && g_runtimeProbeLogger != nullptr
         && g_activeWormMovementLogCount < 64
         && previousActiveOwner != ownerAddressLong) {
         InterlockedIncrement(&g_activeWormMovementLogCount);
@@ -2711,7 +3944,8 @@ void pollWormLiveSamplesFromMemory() {
                 ? "current-team primary movement"
                 : (alreadyActiveWorm ? "active primary movement" : "fallback primary movement"));
 
-        if (g_runtimeProbeLogger != nullptr
+        if (kVerboseRuntimeDiagnostics
+            && g_runtimeProbeLogger != nullptr
             && g_activeWormMovementLogCount < 64
             && (previousActiveOwner != ownerAddressLong || movementPixels >= 8)) {
             InterlockedIncrement(&g_activeWormMovementLogCount);
@@ -3368,7 +4602,9 @@ void maybeUpdateActiveWormCoordinateOffsets(void* owner, LONG xFixed, LONG yFixe
     InterlockedExchange(&g_activeWormCandidateLastYFixed, yFixed);
 
     if (!isPlausibleMapFixedPoint(xFixed, yFixed)) {
-        if (g_runtimeProbeLogger != nullptr && g_activeWormCandidateLogCount < 24) {
+        if (kVerboseRuntimeDiagnostics
+            && g_runtimeProbeLogger != nullptr
+            && g_activeWormCandidateLogCount < 24) {
             InterlockedIncrement(&g_activeWormCandidateLogCount);
             std::ostringstream message;
             message << "runtime probe: active worm owner observed with non-map aggregate fixed "
@@ -3436,7 +4672,9 @@ void maybeUpdateActiveWormCoordinateOffsets(void* owner, LONG xFixed, LONG yFixe
     }
 
     if (bestXOffset < 0 || bestYOffset < 0) {
-        if (g_runtimeProbeLogger != nullptr && g_activeWormCandidateLogCount < 16) {
+        if (kVerboseRuntimeDiagnostics
+            && g_runtimeProbeLogger != nullptr
+            && g_activeWormCandidateLogCount < 16) {
             InterlockedIncrement(&g_activeWormCandidateLogCount);
             std::ostringstream message;
             message << "runtime probe: active worm candidate owner "
@@ -3498,7 +4736,7 @@ std::uintptr_t cameraSlotOffset(int slot) {
 }
 
 extern "C" void __cdecl recordWaCameraTrackingPoint(void* point) noexcept {
-    if (point == nullptr) {
+    if (point == nullptr || !wallOverlayMetadataActive()) {
         return;
     }
 
@@ -3523,7 +4761,9 @@ extern "C" void __cdecl recordWaCameraTrackingPoint(void* point) noexcept {
     InterlockedExchange(&g_cameraTrackingYFixed, yFixed);
 
     const LONG hits = InterlockedIncrement(&g_cameraTrackingProbeHits);
-    if ((hits <= 4 || previousPointAddress != static_cast<LONG>(pointAddress)) && g_runtimeProbeLogger != nullptr) {
+    if (kVerboseRuntimeDiagnostics
+        && (hits <= 4 || previousPointAddress != static_cast<LONG>(pointAddress))
+        && g_runtimeProbeLogger != nullptr) {
         std::ostringstream message;
         message << "runtime probe: W:A camera tracking point captured at "
                 << formatAddress(pointAddress)
@@ -3544,6 +4784,10 @@ extern "C" void __cdecl recordWaCameraTargetAggregateCall(
     LONG xFixed,
     LONG yFixed,
     void* returnAddress) noexcept {
+    if (!wallOverlayMetadataActive()) {
+        return;
+    }
+
     const LONG hits = InterlockedIncrement(&g_cameraTargetAggregateProbeHits);
 
     std::uintptr_t callerRva = 0;
@@ -3607,6 +4851,8 @@ extern "C" void __cdecl recordWaCameraTargetAggregateCall(
         state394 = readWaObjectLong(owner, 0x394);
     }
 
+    noteRecentRopeContext(objectKind);
+
     if (waObjectKindLooksLikeWorm(objectKind)) {
         rememberWormLiveSampleFromOwner(reinterpret_cast<std::uintptr_t>(owner));
     }
@@ -3628,7 +4874,10 @@ extern "C" void __cdecl recordWaCameraTargetAggregateCall(
     InterlockedExchange(&sample->tick, static_cast<LONG>(GetTickCount()));
     const LONG slotHits = InterlockedIncrement(&sample->hits);
 
-    if (g_runtimeProbeLogger != nullptr && slotHits == 1 && g_cameraTargetAggregateProbeLogCount < 32) {
+    if (kVerboseRuntimeDiagnostics
+        && g_runtimeProbeLogger != nullptr
+        && slotHits == 1
+        && g_cameraTargetAggregateProbeLogCount < 32) {
         InterlockedIncrement(&g_cameraTargetAggregateProbeLogCount);
 
         std::ostringstream message;
@@ -3667,6 +4916,10 @@ extern "C" void __cdecl recordWaCameraTargetAggregateCall(
 
 extern "C" void __cdecl recordWaWormMotionCandidateOwner(void* owner) noexcept {
     if (owner == nullptr) {
+        return;
+    }
+
+    if (!wallOverlayMetadataActive()) {
         return;
     }
 
@@ -3745,7 +4998,8 @@ extern "C" void __cdecl recordWaWormMotionCandidateOwner(void* owner) noexcept {
         InterlockedExchange(&g_wormMotionCandidateLastOwnerAddress, static_cast<LONG>(ownerAddress));
     }
 
-    if (g_runtimeProbeLogger != nullptr
+    if (kVerboseRuntimeDiagnostics
+        && g_runtimeProbeLogger != nullptr
         && g_wormMotionCandidateProbeLogCount < 48
         && (hits <= 8 || ownerChanged || currentTeamMatches)) {
         InterlockedIncrement(&g_wormMotionCandidateProbeLogCount);
@@ -3786,11 +5040,12 @@ extern "C" void __cdecl recordWaJumpTerrainCollisionResult(
     LONG xFixed,
     LONG yFixed,
     LONG collisionResult) noexcept {
-    const LONG hits = InterlockedIncrement(&g_jumpTerrainCollisionResultProbeHits);
-    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
-    if (owner == nullptr || g_direct3D9OverlayTestRects.empty()) {
+    if (owner == nullptr || !wallRuntimeHooksShouldProcessFast()) {
         return;
     }
+
+    const LONG hits = InterlockedIncrement(&g_jumpTerrainCollisionResultProbeHits);
+    const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
 
     LONG objectKind = 0;
     LONG teamIndex = 0;
@@ -3805,6 +5060,7 @@ extern "C" void __cdecl recordWaJumpTerrainCollisionResult(
     if (!readObjectKind || !readTeamIndex || !readWormIndex || !readVelocityX || !readVelocityY) {
         return;
     }
+    noteRecentRopeContext(objectKind);
 
     const int xPixels = fixedDeltaToPixels(xFixed);
     const int yPixels = fixedDeltaToPixels(yFixed);
@@ -3855,7 +5111,9 @@ extern "C" void __cdecl recordWaJumpTerrainCollisionResult(
                 "jump-terrain-collision");
         }
 
-        if (g_runtimeProbeLogger != nullptr && g_jumpTerrainCollisionResultLogCount < 96) {
+        if (kVerboseRuntimeDiagnostics
+            && g_runtimeProbeLogger != nullptr
+            && g_jumpTerrainCollisionResultLogCount < 96) {
             InterlockedIncrement(&g_jumpTerrainCollisionResultLogCount);
 
             std::ostringstream message;
@@ -3915,10 +5173,11 @@ extern "C" void __cdecl recordWaMovementResolutionResult(
     void* owner,
     LONG result,
     LONG siteRva) noexcept {
-    const LONG hits = InterlockedIncrement(&g_movementResolutionResultProbeHits);
-    if (owner == nullptr || g_direct3D9OverlayTestRects.empty()) {
+    if (owner == nullptr || !wallRuntimeHooksShouldProcessFast()) {
         return;
     }
+
+    const LONG hits = InterlockedIncrement(&g_movementResolutionResultProbeHits);
 
     const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
     LONG ownerKind = 0;
@@ -3963,6 +5222,7 @@ extern "C" void __cdecl recordWaMovementResolutionResult(
     if (!looksLikeWorm || !readOwnerX || !readOwnerY) {
         return;
     }
+    noteRecentRopeContext(ownerKind);
 
     int nearestWall = -1;
     int nearestDistance = 999999;
@@ -4004,7 +5264,9 @@ extern "C" void __cdecl recordWaMovementResolutionResult(
     }
 
     InterlockedIncrement(&g_movementResolutionResultNearWallLogCount);
-    if (g_runtimeProbeLogger == nullptr || g_movementResolutionResultLogCount >= 220) {
+    if (!kVerboseRuntimeDiagnostics
+        || g_runtimeProbeLogger == nullptr
+        || g_movementResolutionResultLogCount >= 220) {
         return;
     }
     InterlockedIncrement(&g_movementResolutionResultLogCount);
@@ -4062,6 +5324,10 @@ extern "C" void __cdecl recordWaMovementCollisionResult(
     LONG xFixed,
     LONG yFixed,
     LONG collisionResult) noexcept {
+    if (owner == nullptr || !wallRuntimeHooksShouldProcessFast()) {
+        return;
+    }
+
     InterlockedIncrement(&g_movementCollisionResultProbeHits);
     const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
     const int xPixels = fixedDeltaToPixels(xFixed);
@@ -4071,13 +5337,15 @@ extern "C" void __cdecl recordWaMovementCollisionResult(
     LONG objectKind = 0;
     const bool readObjectKind = owner != nullptr && tryReadLong(ownerAddress + kWaObjectKindOffset, objectKind);
     const bool looksLikeWorm = readObjectKind && waObjectKindLooksLikeWorm(objectKind);
+    if (readObjectKind) {
+        noteRecentRopeContext(objectKind);
+    }
     const bool activeCandidateMatches =
         g_activeWormCandidateOwnerAddress == static_cast<LONG>(ownerAddress);
 
     const bool physicsOwnerLooksLikeWorm =
         looksLikeWorm || objectKind == 102 || objectKind == 123 || objectKind == 127;
-    if (owner == nullptr
-        || !physicsOwnerLooksLikeWorm
+    if (!physicsOwnerLooksLikeWorm
         || !mapCoordinate
         || g_direct3D9OverlayTestRects.empty()) {
         return;
@@ -4120,6 +5388,10 @@ extern "C" void __cdecl recordWaMovementCollisionResult(
 }
 
 extern "C" void __cdecl recordWaMovementCollisionPath(void* owner, void* collided) noexcept {
+    if (owner == nullptr || !wallRuntimeHooksShouldProcessFast()) {
+        return;
+    }
+
     InterlockedIncrement(&g_movementCollisionPathProbeHits);
     const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
     const auto collidedAddress = reinterpret_cast<std::uintptr_t>(collided);
@@ -4138,6 +5410,9 @@ extern "C" void __cdecl recordWaMovementCollisionPath(void* owner, void* collide
     const int ownerYPixels = readOwnerY ? fixedDeltaToPixels(ownerYFixed) : -9999;
     const bool looksLikeWorm = readOwnerKind
         && (waObjectKindLooksLikeWorm(ownerKind) || ownerKind == 102 || ownerKind == 123 || ownerKind == 127 || ownerKind == 128);
+    if (readOwnerKind) {
+        noteRecentRopeContext(ownerKind);
+    }
     const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
     const bool activeCandidateMatches =
         activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
@@ -4146,8 +5421,7 @@ extern "C" void __cdecl recordWaMovementCollisionPath(void* owner, void* collide
         turnOwnerAddress != 0 && turnOwnerAddress == static_cast<LONG>(ownerAddress);
     const bool currentTeamMatches = waObjectCurrentTeamMatches(owner);
 
-    if (owner == nullptr
-        || !looksLikeWorm
+    if (!looksLikeWorm
         || !readOwnerX
         || !readOwnerY
         || g_direct3D9OverlayTestRects.empty()) {
@@ -4203,6 +5477,10 @@ extern "C" void __cdecl recordWaMovementCollisionPath(void* owner, void* collide
 }
 
 extern "C" void __cdecl recordWaMovementCollisionBranch(void* owner, void* collided) noexcept {
+    if (owner == nullptr || !wallRuntimeHooksShouldProcessFast()) {
+        return;
+    }
+
     InterlockedIncrement(&g_movementCollisionBranchProbeHits);
     const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
     const auto collidedAddress = reinterpret_cast<std::uintptr_t>(collided);
@@ -4220,6 +5498,9 @@ extern "C" void __cdecl recordWaMovementCollisionBranch(void* owner, void* colli
     const int ownerXPixels = readOwnerX ? fixedDeltaToPixels(ownerXFixed) : -9999;
     const int ownerYPixels = readOwnerY ? fixedDeltaToPixels(ownerYFixed) : -9999;
     const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
+    if (readOwnerKind) {
+        noteRecentRopeContext(ownerKind);
+    }
     const bool activeCandidateMatches =
         activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
     const LONG turnOwnerAddress = g_wallTouchTurnOwnerAddress;
@@ -4276,6 +5557,10 @@ extern "C" void __cdecl recordWaCollisionQueryCommon(
     (void)context;
     (void)surface;
 
+    if (owner == nullptr || !wallRuntimeHooksShouldProcessFast()) {
+        return;
+    }
+
     InterlockedIncrement(&g_collisionQueryCommonProbeHits);
     const auto callerAddress = reinterpret_cast<std::uintptr_t>(caller);
     const auto ownerAddress = reinterpret_cast<std::uintptr_t>(owner);
@@ -4290,6 +5575,9 @@ extern "C" void __cdecl recordWaCollisionQueryCommon(
     const bool readOwnerX = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryXOffset, ownerXFixed);
     const bool readOwnerY = owner != nullptr && tryReadLong(ownerAddress + kWaObjectPrimaryYOffset, ownerYFixed);
     const bool looksLikeWorm = readOwnerKind && waObjectKindLooksLikeWorm(ownerKind);
+    if (readOwnerKind) {
+        noteRecentRopeContext(ownerKind);
+    }
     const LONG activeOwnerAddress = g_activeWormCandidateOwnerAddress;
     const bool activeCandidateMatches =
         activeOwnerAddress != 0 && activeOwnerAddress == static_cast<LONG>(ownerAddress);
@@ -4368,7 +5656,7 @@ extern "C" void __cdecl recordWaCollisionQueryCommon(
 }
 
 extern "C" void __cdecl recordWaCameraRenderOwner(void* owner) noexcept {
-    if (owner == nullptr) {
+    if (owner == nullptr || !wallOverlayMetadataActive()) {
         return;
     }
 
@@ -4394,7 +5682,9 @@ extern "C" void __cdecl recordWaCameraRenderOwner(void* owner) noexcept {
     InterlockedExchange(&g_cameraRenderSampleValid, 1);
 
     const LONG hits = InterlockedIncrement(&g_cameraRenderProbeHits);
-    if ((hits <= 4 || previousPointAddress != static_cast<LONG>(pointAddress)) && g_runtimeProbeLogger != nullptr) {
+    if (kVerboseRuntimeDiagnostics
+        && (hits <= 4 || previousPointAddress != static_cast<LONG>(pointAddress))
+        && g_runtimeProbeLogger != nullptr) {
         std::ostringstream message;
         message << "runtime probe: W:A render camera sample captured at "
                 << formatAddress(pointAddress)
@@ -4438,7 +5728,7 @@ CameraTrackingSnapshot currentCameraTrackingSnapshot(int slot) {
 
     if (snapshot.xFixed == 0 && snapshot.yFixed == 0) {
         const LONG hits = InterlockedIncrement(&g_cameraTrackingZeroSampleLogHits);
-        if (hits <= 4 && g_runtimeProbeLogger != nullptr) {
+        if (kVerboseRuntimeDiagnostics && hits <= 4 && g_runtimeProbeLogger != nullptr) {
             std::ostringstream message;
             message << "runtime probe: W:A camera slot "
                     << slot
@@ -4627,8 +5917,17 @@ int __fastcall hookedWaTurnGameHandleMessage(
     void* data) {
     InterlockedIncrement(&g_turnGameHandleMessageProbeHits);
 
-    if (waTaskMessageLooksTurnRelated(messageType)) {
+    const bool wallModeCandidate =
+        wallOverlayMetadataActive()
+        || messageType == kWallGameTaskMessageMetadataFrame;
+
+    if (wallModeCandidate && waTaskMessageLooksTurnRelated(messageType)) {
         logTurnGameMessageProbe("before", turnGame, sender, messageType, dataSize, data, 0);
+    }
+
+    if (messageType == kWallGameTaskMessageMetadataFrame) {
+        handleIncomingOnlineMetadataFrame(data, dataSize);
+        return 0;
     }
 
     int result = 0;
@@ -4636,19 +5935,103 @@ int __fastcall hookedWaTurnGameHandleMessage(
         result = g_originalWaTurnGameHandleMessage(turnGame, edx, sender, messageType, dataSize, data);
     }
 
-    if (waTaskMessageLooksTurnRelated(messageType)) {
+    if (wallModeCandidate && waTaskMessageLooksTurnRelated(messageType)) {
+        noteWallGameplayTaskActivity();
         logTurnGameMessageProbe("after", turnGame, sender, messageType, dataSize, data, result);
     }
 
-    if (messageType == 7) {
+    if (wallModeCandidate && messageType == 7) {
         markCrateCollectedThisTurn(sender, data, dataSize);
     }
 
-    if (messageType == 52) {
+    if (wallModeCandidate && messageType == 52) {
         resetCrateCollectionForNewTurn("CTaskTurnGame FinishTurn");
         resetTouchedOverlayWallsForTurnGameFinishTurn(turnGame, data, dataSize);
     }
 
+    return result;
+}
+
+int __fastcall hookedWaHostLobbyPacketHandler(
+    void* host,
+    void* edx,
+    int slot,
+    unsigned char* packet,
+    std::size_t size) {
+    std::uint8_t messageType = 0;
+    const std::uint8_t* payload = nullptr;
+    std::size_t payloadSize = 0;
+    std::uint16_t protocolVersion = 0;
+    if (g_onlineSyncEnabled
+        && parseWallLobbyPacket(packet, size, messageType, payload, payloadSize, protocolVersion)) {
+        handleWallLobbyPacketAsHost(slot, messageType, protocolVersion, payload, payloadSize);
+        return 0;
+    }
+
+    maybeBroadcastQueuedOnlineMetadataForLobbySlot(slot);
+
+    if (g_originalWaHostLobbyPacketHandler == nullptr) {
+        return 0;
+    }
+    return g_originalWaHostLobbyPacketHandler(host, edx, slot, packet, size);
+}
+
+int __fastcall hookedWaClientLobbyPacketHandler(
+    void* client,
+    void* edx,
+    unsigned char* packet,
+    std::size_t size) {
+    std::uint8_t messageType = 0;
+    const std::uint8_t* payload = nullptr;
+    std::size_t payloadSize = 0;
+    std::uint16_t protocolVersion = 0;
+    if (g_onlineSyncEnabled
+        && parseWallLobbyPacket(packet, size, messageType, payload, payloadSize, protocolVersion)) {
+        handleWallLobbyPacketAsClient(messageType, protocolVersion, payload, payloadSize);
+        return 0;
+    }
+
+    if (g_originalWaClientLobbyPacketHandler == nullptr) {
+        return 0;
+    }
+    return g_originalWaClientLobbyPacketHandler(client, edx, packet, size);
+}
+
+int __stdcall hookedWaConstructLobbyHostScreen(int screen, int arg) {
+    int result = 0;
+    if (g_originalWaConstructLobbyHostScreen != nullptr) {
+        result = g_originalWaConstructLobbyHostScreen(screen, arg);
+    }
+
+    g_lobbyHostScreenAddress = static_cast<std::uintptr_t>(screen);
+    g_lobbyClientScreenAddress = 0;
+    resetWallGameplayTaskActivity();
+    if (g_runtimeProbeLogger != nullptr && g_onlineLobbyHookLogCount < 16) {
+        InterlockedIncrement(&g_onlineLobbyHookLogCount);
+        std::ostringstream message;
+        message << "online lobby sync: host lobby screen constructed at "
+                << formatAddress(g_lobbyHostScreenAddress);
+        g_runtimeProbeLogger->info(message.str());
+    }
+    return result;
+}
+
+int __stdcall hookedWaConstructLobbyClientScreen(int screen, int arg) {
+    int result = 0;
+    if (g_originalWaConstructLobbyClientScreen != nullptr) {
+        result = g_originalWaConstructLobbyClientScreen(screen, arg);
+    }
+
+    g_lobbyClientScreenAddress = static_cast<std::uintptr_t>(screen);
+    g_lobbyHostScreenAddress = 0;
+    resetWallGameplayTaskActivity();
+    if (g_runtimeProbeLogger != nullptr && g_onlineLobbyHookLogCount < 16) {
+        InterlockedIncrement(&g_onlineLobbyHookLogCount);
+        std::ostringstream message;
+        message << "online lobby sync: client lobby screen constructed at "
+                << formatAddress(g_lobbyClientScreenAddress);
+        g_runtimeProbeLogger->info(message.str());
+    }
     return result;
 }
 
@@ -5539,6 +6922,8 @@ bool installWaCameraRenderCopyProbe(
         return false;
     }
 
+    g_cameraRenderCopyProbeStub = stub;
+
     std::ostringstream message;
     message << "runtime probe: W:A camera render copy hook installed at "
             << formatAddress(reinterpret_cast<std::uintptr_t>(target))
@@ -5777,6 +7162,323 @@ bool installWaTurnGameHandleMessageProbe(
     }
     logger.info(message.str());
     return true;
+}
+
+bool findWaHookPatternMask(
+    Logger& logger,
+    const ProcessModuleView& module,
+    const char* name,
+    const char* patternBytes,
+    const char* mask,
+    std::uintptr_t& address) {
+    address = 0;
+    if (patternBytes == nullptr || mask == nullptr || mask[0] == '\0') {
+        logger.warn(std::string("online lobby sync: invalid ") + name + " masked pattern");
+        return false;
+    }
+
+    BytePattern pattern;
+    const std::size_t size = std::strlen(mask);
+    pattern.bytes.reserve(size);
+    pattern.mask.reserve(size);
+    for (std::size_t index = 0; index < size; ++index) {
+        pattern.bytes.push_back(static_cast<std::uint8_t>(patternBytes[index]));
+        pattern.mask.push_back(mask[index] != '?');
+    }
+
+    const std::vector<std::uintptr_t> matches = findBytePattern(module, pattern, 2);
+    if (matches.empty()) {
+        logger.warn(std::string("online lobby sync: missing W:A signature: ") + name);
+        return false;
+    }
+
+    if (matches.size() > 1) {
+        std::ostringstream message;
+        message << "online lobby sync: "
+                << name
+                << " matched "
+                << matches.size()
+                << " locations; using first match";
+        logger.warn(message.str());
+    }
+
+    address = matches.front();
+    std::ostringstream message;
+    message << "online lobby sync: "
+            << name
+            << " at "
+            << formatAddress(address)
+            << " (RVA "
+            << formatRva(address, module.base)
+            << ")";
+    logger.info(message.str());
+    return true;
+}
+
+bool tryReadPointer(std::uintptr_t address, std::uintptr_t& value) {
+    value = 0;
+    if (!isReadableMemoryRange(address, sizeof(std::uintptr_t))) {
+        return false;
+    }
+
+    value = *reinterpret_cast<std::uintptr_t*>(address);
+    return value != 0;
+}
+
+bool resolveExistingRelativeJump(std::uint8_t* target, std::uintptr_t& detourAddress) {
+    detourAddress = 0;
+    if (target == nullptr || target[0] != 0xE9) {
+        return false;
+    }
+
+    std::int32_t relative = 0;
+    std::memcpy(&relative, target + 1, sizeof(relative));
+    detourAddress = reinterpret_cast<std::uintptr_t>(target + kX86JumpBytes) + relative;
+    return detourAddress != 0;
+}
+
+bool installWaOnlineLobbyDetour(
+    Logger& logger,
+    const char* name,
+    std::uintptr_t address,
+    void* detour,
+    std::size_t patchLength,
+    X86DetourHook& hook,
+    void*& original) {
+    original = nullptr;
+    if (address == 0 || detour == nullptr) {
+        return false;
+    }
+
+    auto* target = reinterpret_cast<std::uint8_t*>(address);
+    std::uintptr_t existingDetour = 0;
+    const bool chainedExistingDetour = resolveExistingRelativeJump(target, existingDetour);
+    const std::size_t effectivePatchLength = chainedExistingDetour ? kX86JumpBytes : patchLength;
+
+    std::string hookError;
+    if (!hook.install(target, detour, effectivePatchLength, hookError)) {
+        logger.warn(std::string("online lobby sync: failed to install ") + name + " hook: " + hookError);
+        return false;
+    }
+
+    original = chainedExistingDetour
+        ? reinterpret_cast<void*>(existingDetour)
+        : hook.trampoline();
+
+    std::ostringstream message;
+    message << "online lobby sync: "
+            << name
+            << " hook installed at "
+            << formatAddress(address)
+            << ", trampoline "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(original));
+    if (chainedExistingDetour) {
+        message << ", chained existing detour " << formatAddress(existingDetour);
+    }
+    logger.info(message.str());
+    return true;
+}
+
+bool installWaOnlineLobbySyncHooks(
+    Logger& logger,
+    const ProcessModuleView& module,
+    X86DetourHook& hostLobbyPacketHandlerHook,
+    X86DetourHook& clientLobbyPacketHandlerHook,
+    X86DetourHook& constructLobbyHostScreenHook,
+    X86DetourHook& constructLobbyClientScreenHook) {
+    bool installedAnyHook = false;
+    std::uintptr_t hostUnicastAddress = 0;
+    std::uintptr_t hostLobbyPacketHandlerAddress = 0;
+    std::uintptr_t hostEndscreenPacketHandlerAddress = 0;
+    std::uintptr_t hostSlotListConstructorAddress = 0;
+    std::uintptr_t clientLobbyPacketHandlerAddress = 0;
+    std::uintptr_t clientEndscreenPacketHandlerAddress = 0;
+    std::uintptr_t constructLobbyHostScreenAddress = 0;
+    std::uintptr_t constructLobbyClientScreenAddress = 0;
+    std::uintptr_t lobbyDisplayMessageAddress = 0;
+
+    findWaHookPatternMask(
+        logger,
+        module,
+        "HostUnicast",
+        "\x8B\x44\x24\x04\x83\x78\x0C\x00\x74\x28\x69\xC9\x00\x00\x00\x00"
+        "\x03\xC1\x83\xB8\x00\x00\x00\x00\x00\x75\x2F\x8D\x88\x00\x00\x00"
+        "\x00\x8B\x01\x52",
+        "??????xxxx??????xxxx?????xxxx????xxx",
+        hostUnicastAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "HostLobbyPacketHandler",
+        "\x83\xEC\x10\x8B\x44\x24\x1C\x83\xF8\x02\x53\x8B\xD9\x89\x5C\x24"
+        "\x04\x0F\x82\x00\x00\x00\x00\x55\x8B\x6C\x24\x20\x0F\xB7\x4D\x00"
+        "\x85\xC9\x56\x57\x0F\x84\x00\x00\x00\x00\x83\xF9\x10\x0F\x84\x00"
+        "\x00\x00\x00\x83\xF9\x1A\x74\x18",
+        "???????xxxxxxxxxxxx????xxxxxxxxxxxxxxx????xxxxx????xxxxx",
+        hostLobbyPacketHandlerAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "HostEndscreenPacketHandler",
+        "\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x64\x89"
+        "\x25\x00\x00\x00\x00\x83\xEC\x20\x53\x55\x56\x8B\x74\x24\x40\x0F"
+        "\xB7\x06\x57\x33\xDB\x3B\xC3\x8B\xF9\x89\x7C\x24\x2C\x0F\x84\x00"
+        "\x00\x00\x00\x83\xF8\x0F\x0F\x85\x00\x00\x00\x00",
+        "???????xx????xxxx????xxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxx????",
+        hostEndscreenPacketHandlerAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "ClientLobbyPacketHandler",
+        "\x55\x8B\xEC\x83\xE4\xF8\x83\xEC\x24\x53\x8B\x5D\x0C\x83\xFB\x02"
+        "\x56\x8B\xF1\x57\x89\x74\x24\x10\x0F\x82\x00\x00\x00\x00\x8B\x7D"
+        "\x08\x0F\xB7\x0F\x0F\xB7\xC1\x83\xF8\x32\x0F\x87\x00\x00\x00\x00"
+        "\x0F\xB6\x90\x00\x00\x00\x00\xFF\x24\x95\x00\x00\x00\x00\x53",
+        "??????xxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxx????xxx????xxx????x",
+        clientLobbyPacketHandlerAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "ClientEndscreenPacketHandler",
+        "\x55\x8B\xEC\x83\xE4\xF8\x83\xEC\x08\x56\x8B\x75\x08\x0F\xB7\x06"
+        "\x83\xC0\xE7\x83\xF8\x10\x57\x8B\xF9\x0F\x87\x00\x00\x00\x00\x0F"
+        "\xB6\x80\x00\x00\x00\x00\xFF\x24\x85\x00\x00\x00\x00\x83\x7D\x0C"
+        "\x08\x0F\x82\x00\x00\x00\x00\x8B\x4E\x04\x83\xE9\x01\x83\xF9\x0C"
+        "\x0F\x83\x00\x00\x00\x00",
+        "??????xxxxxxxxxxxxxxxxxxxxx????xxx????xxx????xxxxxx????xxxxxxxxxxx????",
+        clientEndscreenPacketHandlerAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "HostSlotListConstructor",
+        "\x64\xA1\x00\x00\x00\x00\x6A\xFF\x68\x00\x00\x00\x00\x50\x64\x89"
+        "\x25\x00\x00\x00\x00\x56\x8B\x74\x24\x14\x68\x00\x00\x00\x00\x68"
+        "\x00\x00\x00\x00\xB8\x00\x00\x00\x00\x6A\x06\x89\x46\x04\x89\x46"
+        "\x08\x68\x00\x00\x00\x00\x8D\x86\x00\x00\x00\x00",
+        "??????xxx????xxxx????xxxxxx????x????x????xxxxxxxxx????xx????",
+        hostSlotListConstructorAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "ConstructLobbyHostScreen",
+        "\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x64\x89"
+        "\x25\x00\x00\x00\x00\x83\xEC\x5C\x53\x8B\x5C\x24\x74\x55\x8B\x6C"
+        "\x24\x74\x57\x8D\xBD\x00\x00\x00\x00\x57\x53\x68\x00\x00\x00\x00",
+        "???????xx????xxxx????xxxxxxxxxxxxxxxx????xxx????",
+        constructLobbyHostScreenAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "ConstructLobbyClientScreen",
+        "\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x64\x89"
+        "\x25\x00\x00\x00\x00\x83\xEC\x5C\x53\x8B\x5C\x24\x74\x55\x8B\x6C"
+        "\x24\x74\x56\x57\x53\x55\xB9\x00\x00\x00\x00",
+        "???????xx????xxxx????xxxxxxxxxxxxxxxxxx????",
+        constructLobbyClientScreenAddress);
+    findWaHookPatternMask(
+        logger,
+        module,
+        "LobbyDisplayMessage",
+        "\x55\x8B\xEC\x83\xE4\xF8\x64\xA1\x00\x00\x00\x00\x6A\xFF\x68\x00"
+        "\x00\x00\x00\x50\x64\x89\x25\x00\x00\x00\x00\x83\xEC\x30\x53\x56"
+        "\x57\xE8\x00\x00\x00\x00\x33\xC9\x85\xC0\x0F\x95\xC1\x85\xC9\x75"
+        "\x0A\x68\x00\x00\x00\x00\xE8\x00\x00\x00\x00",
+        "??????xx????xxx????xxxx????xxxxxxx????xxxxxxxxxxxx????x????",
+        lobbyDisplayMessageAddress);
+
+    g_lobbyHostUnicastAddress = hostUnicastAddress;
+    if (hostEndscreenPacketHandlerAddress != 0
+        && !tryReadPointer(hostEndscreenPacketHandlerAddress + 0xC6, g_lobbyHostSlotAddress)) {
+        logger.warn("online lobby sync: failed to resolve host slot pointer");
+    }
+    if (hostSlotListConstructorAddress != 0) {
+        std::uintptr_t hostVtable = 0;
+        if (tryReadPointer(hostSlotListConstructorAddress + 0x5D, hostVtable)
+            && !tryReadPointer(hostVtable + (9 * sizeof(std::uintptr_t)), g_lobbyHostIncomingConnectionAddress)) {
+            logger.warn("online lobby sync: failed to resolve host incoming connection pointer");
+        }
+    }
+    if (clientEndscreenPacketHandlerAddress != 0
+        && !tryReadPointer(clientEndscreenPacketHandlerAddress + 0x103, g_lobbyClientSlotAddress)) {
+        logger.warn("online lobby sync: failed to resolve client slot pointer");
+    }
+    if (lobbyDisplayMessageAddress != 0) {
+        g_waLobbyDisplayMessage = reinterpret_cast<WaLobbyDisplayMessageFunction>(lobbyDisplayMessageAddress);
+    }
+
+    if (hostLobbyPacketHandlerAddress != 0) {
+        void* original = nullptr;
+        if (installWaOnlineLobbyDetour(
+                logger,
+                "host lobby packet",
+                hostLobbyPacketHandlerAddress,
+                reinterpret_cast<void*>(&hookedWaHostLobbyPacketHandler),
+                kWaHostLobbyPacketHandlerPatchLength,
+                hostLobbyPacketHandlerHook,
+                original)) {
+            g_originalWaHostLobbyPacketHandler = reinterpret_cast<WaHostLobbyPacketHandlerFunction>(original);
+            installedAnyHook = true;
+        }
+    }
+
+    if (clientLobbyPacketHandlerAddress != 0) {
+        void* original = nullptr;
+        if (installWaOnlineLobbyDetour(
+                logger,
+                "client lobby packet",
+                clientLobbyPacketHandlerAddress,
+                reinterpret_cast<void*>(&hookedWaClientLobbyPacketHandler),
+                kWaClientLobbyPacketHandlerPatchLength,
+                clientLobbyPacketHandlerHook,
+                original)) {
+            g_originalWaClientLobbyPacketHandler = reinterpret_cast<WaClientLobbyPacketHandlerFunction>(original);
+            installedAnyHook = true;
+        }
+    }
+
+    if (constructLobbyHostScreenAddress != 0) {
+        void* original = nullptr;
+        if (installWaOnlineLobbyDetour(
+                logger,
+                "host lobby screen",
+                constructLobbyHostScreenAddress,
+                reinterpret_cast<void*>(&hookedWaConstructLobbyHostScreen),
+                kWaLobbyScreenConstructorPatchLength,
+                constructLobbyHostScreenHook,
+                original)) {
+            g_originalWaConstructLobbyHostScreen = reinterpret_cast<WaConstructLobbyScreenFunction>(original);
+            installedAnyHook = true;
+        }
+    }
+
+    if (constructLobbyClientScreenAddress != 0) {
+        void* original = nullptr;
+        if (installWaOnlineLobbyDetour(
+                logger,
+                "client lobby screen",
+                constructLobbyClientScreenAddress,
+                reinterpret_cast<void*>(&hookedWaConstructLobbyClientScreen),
+                kWaLobbyScreenConstructorPatchLength,
+                constructLobbyClientScreenHook,
+                original)) {
+            g_originalWaConstructLobbyClientScreen = reinterpret_cast<WaConstructLobbyScreenFunction>(original);
+            installedAnyHook = true;
+        }
+    }
+
+    std::ostringstream summary;
+    summary << "online lobby sync: resolved hostSlot="
+            << formatAddress(g_lobbyHostSlotAddress)
+            << ", hostIncomingConnection="
+            << formatAddress(g_lobbyHostIncomingConnectionAddress)
+            << ", clientSlot="
+            << formatAddress(g_lobbyClientSlotAddress)
+            << ", hostUnicast="
+            << formatAddress(g_lobbyHostUnicastAddress)
+            << ", lobbyDisplayMessage="
+            << formatAddress(reinterpret_cast<std::uintptr_t>(g_waLobbyDisplayMessage));
+    logger.info(summary.str());
+    return installedAnyHook;
 }
 
 bool installWaWormMotionCandidateProbe(
@@ -6475,6 +8177,197 @@ Direct3D9OverlayRect makeDirect3D9OverlayRect(const WaOverlayRect& rect) {
     };
 }
 
+WallMapMetadata wallMetadataFromOverlayMap(const WaOverlayMap& map) {
+    WallMapMetadata metadata;
+    metadata.name = map.name;
+    metadata.fileName = map.fileName;
+    metadata.sha256 = map.sha256;
+    metadata.width = map.width;
+    metadata.height = map.height;
+    metadata.walls.reserve(map.rects.size());
+
+    for (const WaOverlayRect& rect : map.rects) {
+        if (rect.right <= rect.left || rect.bottom <= rect.top) {
+            continue;
+        }
+
+        WallRect wall;
+        wall.name = "Wall" + std::to_string(metadata.walls.size() + 1);
+        wall.x = rect.left;
+        wall.y = rect.top;
+        wall.width = rect.right - rect.left;
+        wall.height = rect.bottom - rect.top;
+        wall.color = rect.touchedArgb & 0x00FFFFFF;
+        metadata.walls.push_back(wall);
+    }
+
+    return metadata;
+}
+
+WaOverlayMap overlayMapFromWallMetadata(const WallMapMetadata& metadata) {
+    WaOverlayMap map;
+    map.name = metadata.name;
+    map.fileName = metadata.fileName;
+    map.sha256 = metadata.sha256;
+    map.width = metadata.width;
+    map.height = metadata.height;
+    map.rects.reserve(metadata.walls.size());
+
+    for (std::size_t index = 0; index < metadata.walls.size(); ++index) {
+        const WallRect& wall = metadata.walls[index];
+        if (wall.width <= 0 || wall.height <= 0) {
+            continue;
+        }
+
+        map.rects.push_back(WaOverlayRect{
+            wall.x,
+            wall.y,
+            wall.x + wall.width,
+            wall.y + wall.height,
+            0xFFFF00FF,
+            0xFF000000 | (wall.color & 0x00FFFFFF),
+            index,
+        });
+    }
+
+    return map;
+}
+
+bool overlayMapsDescribeSameMap(const WaOverlayMap& left, const WaOverlayMap& right) {
+    if (!left.sha256.empty() && !right.sha256.empty()) {
+        return sameAsciiText(left.sha256, right.sha256);
+    }
+
+    return sameFileName(left.fileName, right.fileName)
+        && left.width > 0
+        && left.height > 0
+        && left.width == right.width
+        && left.height == right.height;
+}
+
+void resetOnlineMetadataTransportState() {
+    std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+    g_onlineOutgoingFrames.clear();
+    g_onlineIncomingMetadata.reset();
+    InterlockedExchange(&g_onlineMetadataBroadcastMapIndex, -1);
+    InterlockedExchange(&g_onlineLobbySeenSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyCompatibleSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyBroadcastSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyQuerySlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyLastConnectedSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyCompatibilityDeadlineTick, 0);
+    InterlockedExchange(&g_onlineLobbyCompatibilityReported, 0);
+}
+
+void queueOnlineMetadataBroadcastForMap(std::size_t mapIndex) {
+    if (!g_onlineSyncEnabled
+        || !isOnlineLobbyHostContext()
+        || mapIndex >= g_direct3D9OverlayMaps.size()) {
+        return;
+    }
+
+    const LONG currentBroadcastIndex = g_onlineMetadataBroadcastMapIndex;
+    if (currentBroadcastIndex == static_cast<LONG>(mapIndex)) {
+        bool hasQueuedFrames = false;
+        {
+            std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+            hasQueuedFrames = !g_onlineOutgoingFrames.empty();
+        }
+        if (hasQueuedFrames) {
+            return;
+        }
+    }
+
+    const WallMapMetadata metadata = wallMetadataFromOverlayMap(g_direct3D9OverlayMaps[mapIndex]);
+    if (metadata.walls.empty()) {
+        return;
+    }
+
+    std::vector<std::vector<std::uint8_t>> frames;
+    try {
+        const std::vector<WallTransportFrame> transportFrames = makeWallMetadataFrames(
+            metadata,
+            static_cast<std::uint32_t>(GetTickCount()));
+        frames.reserve(transportFrames.size());
+        for (const WallTransportFrame& frame : transportFrames) {
+            frames.push_back(serializeWallTransportFrame(frame));
+        }
+    } catch (...) {
+        if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
+            InterlockedIncrement(&g_onlineMetadataErrorLogCount);
+            g_runtimeProbeLogger->warn("online sync: failed to serialize host wall metadata");
+        }
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+        g_onlineOutgoingFrames = std::move(frames);
+        InterlockedExchange(&g_onlineMetadataBroadcastMapIndex, static_cast<LONG>(mapIndex));
+        InterlockedExchange(&g_onlineLobbyLastBroadcastTick, 0);
+        InterlockedExchange(&g_onlineLobbySeenSlotMask, 0);
+        InterlockedExchange(&g_onlineLobbyCompatibleSlotMask, 0);
+        InterlockedExchange(&g_onlineLobbyBroadcastSlotMask, 0);
+        InterlockedExchange(&g_onlineLobbyQuerySlotMask, 0);
+        InterlockedExchange(&g_onlineLobbyLastConnectedSlotMask, 0);
+        InterlockedExchange(&g_onlineLobbyCompatibilityDeadlineTick, 0);
+        InterlockedExchange(&g_onlineLobbyCompatibilityReported, 0);
+    }
+    trustActiveOverlayMapForOnlineMetadata(mapIndex);
+
+    if (g_runtimeProbeLogger != nullptr && g_onlineMetadataSendLogCount < 24) {
+        InterlockedIncrement(&g_onlineMetadataSendLogCount);
+        std::ostringstream message;
+        message << "online sync: queued host metadata for \""
+                << metadata.name
+                << "\" with "
+                << metadata.walls.size()
+                << " wall(s)";
+        g_runtimeProbeLogger->info(message.str());
+    }
+
+    broadcastQueuedOnlineMetadataToLobby();
+}
+
+bool activeOverlayMapMatchesHostMetadata(const WallMapMetadata& metadata) {
+    const LONG activeIndex = g_direct3D9ActiveOverlayMapIndex;
+    if (activeIndex < 0 || static_cast<std::size_t>(activeIndex) >= g_direct3D9OverlayMaps.size()) {
+        return true;
+    }
+
+    const WaOverlayMap& active = g_direct3D9OverlayMaps[static_cast<std::size_t>(activeIndex)];
+    if (!active.sha256.empty() && !metadata.sha256.empty()) {
+        return sameAsciiText(active.sha256, metadata.sha256);
+    }
+
+    if (active.width > 0 && active.height > 0 && metadata.width > 0 && metadata.height > 0) {
+        return active.width == metadata.width && active.height == metadata.height;
+    }
+
+    return true;
+}
+
+bool addOrUpdateOnlineOverlayMap(const WallMapMetadata& metadata, std::size_t& mapIndex) {
+    WaOverlayMap overlayMap = overlayMapFromWallMetadata(metadata);
+    if (overlayMap.rects.empty()) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < g_direct3D9OverlayMaps.size(); ++index) {
+        if (!overlayMapsDescribeSameMap(g_direct3D9OverlayMaps[index], overlayMap)) {
+            continue;
+        }
+
+        g_direct3D9OverlayMaps[index] = overlayMap;
+        mapIndex = index;
+        return true;
+    }
+
+    g_direct3D9OverlayMaps.push_back(overlayMap);
+    mapIndex = g_direct3D9OverlayMaps.size() - 1;
+    return true;
+}
+
 void clearDirect3D9OverlayMap(const char* reason) {
     const bool hadActiveMap = g_direct3D9ActiveOverlayMapIndex >= 0 || !g_direct3D9OverlayTestRects.empty();
     if (!hadActiveMap) {
@@ -6487,7 +8380,18 @@ void clearDirect3D9OverlayMap(const char* reason) {
     InterlockedExchange(&g_direct3D9ActiveOverlayMapIndex, -1);
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
     InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
+    InterlockedExchange(&g_detectedMapCacheAssociationPending, 0);
+    InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
+    InterlockedExchange(&g_blockedWeaponInputKeyMask, 0);
+    InterlockedExchange(&g_blockedWeaponInputSuppressUntilTick, 0);
+    InterlockedExchange(&g_recentRopeContextTick, 0);
+    clearOnlineMetadataTrust();
+    resetWallGameplayTaskActivity();
+    resetOnlineMetadataTransportState();
     resetTransientGameplayTrackingState("overlay map deactivation", true);
+    if (g_activeHookManager != nullptr && g_runtimeProbeLogger != nullptr) {
+        g_activeHookManager->disableGameplayHooks(*g_runtimeProbeLogger, reason);
+    }
 
     if (g_runtimeProbeLogger != nullptr && g_direct3D9OverlayActivationLogCount < 32) {
         InterlockedIncrement(&g_direct3D9OverlayActivationLogCount);
@@ -6501,7 +8405,7 @@ void clearDirect3D9OverlayMap(const char* reason) {
     }
 }
 
-void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detectedFileName) {
+void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detectedFileName, bool broadcastOnlineMetadata = true) {
     if (mapIndex >= g_direct3D9OverlayMaps.size()) {
         clearDirect3D9OverlayMap("invalid map index");
         return;
@@ -6509,10 +8413,14 @@ void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detect
 
     const LONG activeIndex = g_direct3D9ActiveOverlayMapIndex;
     if (activeIndex == static_cast<LONG>(mapIndex)) {
+        if (broadcastOnlineMetadata) {
+            queueOnlineMetadataBroadcastForMap(mapIndex);
+        }
         return;
     }
 
     const WaOverlayMap& map = g_direct3D9OverlayMaps[mapIndex];
+    clearOnlineMetadataTrust();
     g_direct3D9OverlayTestRects.clear();
     g_direct3D9OverlayTestRects.reserve(map.rects.size());
     for (const WaOverlayRect& rect : map.rects) {
@@ -6525,6 +8433,12 @@ void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detect
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
     InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
     resetTransientGameplayTrackingState("overlay map activation", true);
+    if (g_activeHookManager != nullptr && g_runtimeProbeLogger != nullptr) {
+        g_activeHookManager->ensureGameplayHooks(*g_runtimeProbeLogger, "wall metadata map activation");
+    }
+    if (broadcastOnlineMetadata) {
+        queueOnlineMetadataBroadcastForMap(mapIndex);
+    }
 
     if (g_runtimeProbeLogger != nullptr && g_direct3D9OverlayActivationLogCount < 32) {
         InterlockedIncrement(&g_direct3D9OverlayActivationLogCount);
@@ -6541,6 +8455,101 @@ void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detect
     }
 }
 
+void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
+    if (!g_onlineSyncEnabled || data == nullptr || dataSize == 0) {
+        return;
+    }
+
+    WallTransportFrame frame;
+    std::string error;
+    if (!deserializeWallTransportFrame(
+            static_cast<const std::uint8_t*>(data),
+            dataSize,
+            frame,
+            error)) {
+        if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
+            InterlockedIncrement(&g_onlineMetadataErrorLogCount);
+            g_runtimeProbeLogger->warn("online sync: rejected incoming metadata frame: " + error);
+        }
+        return;
+    }
+
+    bool completed = false;
+    std::vector<std::uint8_t> metadataPayload;
+    {
+        std::lock_guard<std::mutex> lock(g_onlineSyncMutex);
+        if (!g_onlineIncomingMetadata.accept(frame, error)) {
+            g_onlineIncomingMetadata.reset();
+            if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
+                InterlockedIncrement(&g_onlineMetadataErrorLogCount);
+                g_runtimeProbeLogger->warn("online sync: failed to accept incoming metadata frame: " + error);
+            }
+            return;
+        }
+
+        completed = g_onlineIncomingMetadata.complete();
+        if (completed) {
+            metadataPayload = g_onlineIncomingMetadata.payload();
+            g_onlineIncomingMetadata.reset();
+        }
+    }
+
+    if (!completed) {
+        if (g_runtimeProbeLogger != nullptr && g_onlineMetadataReceiveLogCount < 24) {
+            InterlockedIncrement(&g_onlineMetadataReceiveLogCount);
+            std::ostringstream message;
+            message << "online sync: accepted metadata frame "
+                    << (frame.chunkIndex + 1)
+                    << "/"
+                    << frame.chunkCount
+                    << " transfer "
+                    << frame.transferId;
+            g_runtimeProbeLogger->info(message.str());
+        }
+        return;
+    }
+
+    WallMapMetadata metadata;
+    if (!deserializeWallMetadata(metadataPayload, metadata, error)) {
+        if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
+            InterlockedIncrement(&g_onlineMetadataErrorLogCount);
+            g_runtimeProbeLogger->warn("online sync: failed to deserialize host metadata: " + error);
+        }
+        return;
+    }
+
+    if (!activeOverlayMapMatchesHostMetadata(metadata)) {
+        if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
+            InterlockedIncrement(&g_onlineMetadataErrorLogCount);
+            g_runtimeProbeLogger->warn("online sync: ignored host metadata because it does not match the active map");
+        }
+        return;
+    }
+
+    std::size_t mapIndex = 0;
+    if (!addOrUpdateOnlineOverlayMap(metadata, mapIndex)) {
+        if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
+            InterlockedIncrement(&g_onlineMetadataErrorLogCount);
+            g_runtimeProbeLogger->warn("online sync: host metadata had no valid walls");
+        }
+        return;
+    }
+
+    activateDirect3D9OverlayMap(mapIndex, metadata.fileName, false);
+    trustActiveOverlayMapForOnlineMetadata(mapIndex);
+
+    if (g_runtimeProbeLogger != nullptr && g_onlineMetadataReceiveLogCount < 24) {
+        InterlockedIncrement(&g_onlineMetadataReceiveLogCount);
+        std::ostringstream message;
+        message << "online sync: applied host metadata \""
+                << metadata.name
+                << "\" with "
+                << metadata.walls.size()
+                << " wall(s)";
+        g_runtimeProbeLogger->info(message.str());
+    }
+}
+
 void refreshDetectedMapCacheForActiveOverlay() {
     if (g_detectedMapCachePath.empty()
         || g_customDatPath.empty()
@@ -6550,7 +8559,7 @@ void refreshDetectedMapCacheForActiveOverlay() {
 
     const DWORD now = GetTickCount();
     const DWORD previousRefresh = static_cast<DWORD>(g_detectedMapCacheRefreshTick);
-    if (previousRefresh != 0 && now - previousRefresh < 1000) {
+    if (previousRefresh != 0 && now - previousRefresh < kDetectedMapCacheRefreshPollMilliseconds) {
         return;
     }
     InterlockedExchange(&g_detectedMapCacheRefreshTick, static_cast<LONG>(now));
@@ -6566,29 +8575,31 @@ void refreshDetectedMapCacheForActiveOverlay() {
         return;
     }
 
-    std::size_t mapIndex = 0;
-    if (!direct3D9OverlayMapIndexForFileName(detectedPath, mapIndex)
-        || static_cast<LONG>(mapIndex) != g_direct3D9ActiveOverlayMapIndex) {
+    const LONG activeIndex = g_direct3D9ActiveOverlayMapIndex;
+    if (activeIndex < 0 || static_cast<std::size_t>(activeIndex) >= g_direct3D9OverlayMaps.size()) {
         return;
     }
 
-    const std::string customDatSha256 = sha256FileHex(g_customDatPath);
-    if (customDatSha256.empty()) {
+    const WaOverlayMap& activeMap = g_direct3D9OverlayMaps[static_cast<std::size_t>(activeIndex)];
+    if (!sameFileName(activeMap.fileName, detectedFileName)) {
         return;
     }
 
-    if (sameAsciiText(customDatSha256, g_detectedMapCachedCustomDatSha256)) {
+    const std::uint64_t customDatWriteTime = fileWriteTimeUtc(g_customDatPath);
+    if (customDatWriteTime == 0 || customDatWriteTime == g_detectedMapCachedCustomDatWriteTime) {
         return;
     }
 
     const bool associationPending = g_detectedMapCacheAssociationPending != 0;
     const DWORD detectedMapTick = static_cast<DWORD>(g_detectedMapTick);
     const bool detectedFromCache = g_detectedMapFromCacheSeed != 0;
+    const bool onlineTrustedMap = activeOverlayMapTrustedByOnlineMetadata(activeIndex)
+        && !detectedFromCache;
     const bool recentRealMapDetection = associationPending
         && !detectedFromCache
         && detectedMapTick != 0
         && now - detectedMapTick <= kDetectedMapCacheRefreshWindowMilliseconds;
-    if (!recentRealMapDetection) {
+    if (!recentRealMapDetection && !onlineTrustedMap) {
         {
             std::lock_guard<std::mutex> lock(g_detectedMapMutex);
             g_detectedMapPath.clear();
@@ -6611,6 +8622,11 @@ void refreshDetectedMapCacheForActiveOverlay() {
     }
 
     writeDetectedMapCache(detectedPath, detectedFileName, true);
+    InterlockedExchange(&g_detectedMapCacheAssociationPending, 0);
+    InterlockedExchange(&g_detectedMapFromCacheSeed, 0);
+    if (onlineTrustedMap && !recentRealMapDetection) {
+        clearOnlineMetadataTrust();
+    }
 
     if (g_runtimeProbeLogger != nullptr && g_detectedMapCacheRefreshLogCount < 8) {
         InterlockedIncrement(&g_detectedMapCacheRefreshLogCount);
@@ -6624,6 +8640,13 @@ void refreshDetectedMapCacheForActiveOverlay() {
 }
 
 void seedDetectedMapFromCacheIfCurrent() {
+    if (g_runtimeProbeLogger != nullptr
+        && InterlockedCompareExchange(&g_cachedDefaultMapSeedLogCount, 1, 0) == 0) {
+        g_runtimeProbeLogger->info(
+            "runtime probe: persistent cached map auto-activation disabled; waiting for real map detection");
+    }
+    return;
+
     if (g_cachedDefaultMapPath.empty()
         || g_cachedDefaultMapCustomDatSha256.empty()
         || g_direct3D9ActiveOverlayMapIndex >= 0
@@ -6850,7 +8873,7 @@ void logMetadataOverlayTransform(
     int baseX,
     int baseY,
     const CameraTrackingSnapshot& camera) {
-    if (g_runtimeProbeLogger == nullptr) {
+    if (!kVerboseRuntimeDiagnostics || g_runtimeProbeLogger == nullptr) {
         return;
     }
 
@@ -7314,7 +9337,10 @@ void drawDirect3D9ActiveWormCandidateOverlayTest(IDirect3DDevice9* device) {
     const LONG previousY = g_activeWormCandidateLastYFixed;
     const int distance = std::abs(xPixels - fixedDeltaToPixels(previousX))
         + std::abs(yPixels - fixedDeltaToPixels(previousY));
-    if (distance >= 16 && g_runtimeProbeLogger != nullptr && g_activeWormCandidatePollLogCount < 48) {
+    if (kVerboseRuntimeDiagnostics
+        && distance >= 16
+        && g_runtimeProbeLogger != nullptr
+        && g_activeWormCandidatePollLogCount < 48) {
         InterlockedExchange(&g_activeWormCandidateLastXFixed, xFixed);
         InterlockedExchange(&g_activeWormCandidateLastYFixed, yFixed);
         InterlockedIncrement(&g_activeWormCandidatePollLogCount);
@@ -7368,15 +9394,24 @@ bool prepareMetadataOverlayScreenRects(
     screenRects.clear();
 
     syncDirect3D9OverlayMapFromDetectedFile();
-    refreshDetectedMapCacheForActiveOverlay();
 
-    if (g_direct3D9OverlayTestRects.empty()) {
+    if (!onlineWallModuleAllowedForCurrentContext()) {
+        return false;
+    }
+
+    if (!wallOverlayMetadataActive()) {
         return false;
     }
 
     if (!direct3D9OverlayGameplayReady()) {
         return false;
     }
+
+    if (!wallGameplayRulesActiveForCurrentMap()) {
+        return false;
+    }
+
+    refreshDetectedMapCacheForActiveOverlay();
 
     if (renderTargetWidth == 0 || renderTargetHeight == 0) {
         return false;
@@ -7540,6 +9575,10 @@ bool metadataOverlayHiddenByChatForFallbackRenderer(const char* rendererName) {
 }
 
 void drawDirect3D9OverlayTestRects(IDirect3DDevice9* device) {
+    if (!wallOverlayMetadataActive()) {
+        return;
+    }
+
     UINT renderTargetWidth = 0;
     UINT renderTargetHeight = 0;
     if (!getDirect3D9RenderTargetSize(device, renderTargetWidth, renderTargetHeight)) {
@@ -7711,6 +9750,10 @@ bool drawOpenGLOverlayRect(const ScreenOverlayRect& rect, UINT viewportWidth, UI
 }
 
 void drawOpenGLOverlayTestRects(OpenGLOverlayPass pass) {
+    if (!wallOverlayMetadataActive()) {
+        return;
+    }
+
     UINT viewportWidth = 0;
     UINT viewportHeight = 0;
     if (!getOpenGLViewportSize(viewportWidth, viewportHeight)) {
@@ -8040,6 +10083,10 @@ void drawDirectDrawOverlayTestRects(
     void* surface,
     const DirectDrawSurfaceVtableHook& hook,
     const char* triggerName) {
+    if (!wallOverlayMetadataActive()) {
+        return;
+    }
+
     if (surface == nullptr || hook.originalBlt == nullptr) {
         return;
     }
@@ -9358,16 +11405,56 @@ bool selectedWeaponRequiresRopeToAttack(LONG weaponId) {
     }
 }
 
+bool ownerKindLooksLikeRopeContext(LONG ownerKind) {
+    return ownerKind == 115
+        || ownerKind == 123
+        || ownerKind == 127
+        || ownerKind == 128;
+}
+
+void noteRecentRopeContext(LONG ownerKind) {
+    if (ownerKindLooksLikeRopeContext(ownerKind)) {
+        InterlockedExchange(&g_recentRopeContextTick, static_cast<LONG>(GetTickCount()));
+    }
+}
+
+bool recentRopeContextActive() {
+    const DWORD tick = static_cast<DWORD>(g_recentRopeContextTick);
+    return tick != 0 && GetTickCount() - tick <= 250;
+}
+
+bool blockedWeaponInputKeyStateSuppressed(int key) {
+    const LONG keyMask = weaponInputKeyMask(key);
+    if (keyMask == 0) {
+        return false;
+    }
+
+    if ((g_blockedWeaponInputKeyMask & keyMask) != 0) {
+        return true;
+    }
+
+    const LONG untilTick = g_blockedWeaponInputSuppressUntilTick;
+    if (untilTick == 0) {
+        return false;
+    }
+
+    const DWORD now = GetTickCount();
+    if (static_cast<LONG>(now - static_cast<DWORD>(untilTick)) < 0) {
+        return true;
+    }
+
+    InterlockedCompareExchange(&g_blockedWeaponInputSuppressUntilTick, 0, untilTick);
+    return false;
+}
+
 bool activeOwnerLooksLikeRopeContext() {
     LONG ownerKind = 0;
     if (!tryReadActiveOwnerKind(ownerKind)) {
         return false;
     }
 
-    return ownerKind == 115
-        || ownerKind == 123
-        || ownerKind == 127
-        || ownerKind == 128;
+    noteRecentRopeContext(ownerKind);
+    return ownerKindLooksLikeRopeContext(ownerKind);
 }
 
 bool attackRuleShouldBlockWeaponInput(int key, LONG& weaponId, AttackBlockReason& reason) {
@@ -9381,15 +11468,22 @@ bool attackRuleShouldBlockWeaponInput(int key, LONG& weaponId, AttackBlockReason
         return false;
     }
 
-    const bool ropeContext = activeOwnerLooksLikeRopeContext();
+    const bool ropeContext = activeOwnerLooksLikeRopeContext() || recentRopeContextActive();
     if (key == VK_RETURN && !ropeContext) {
+        return false;
+    }
+
+    if (key == VK_SPACE && ropeContext) {
         return false;
     }
 
     const AttackBlockReason prerequisiteReason = currentAttackBlockReason();
     if (!tryReadActiveSelectedWeaponId(weaponId)) {
-        reason = prerequisiteReason;
-        return reason != AttackBlockReason::None;
+        return false;
+    }
+
+    if (selectedWeaponBypassesAttackRequirements(weaponId)) {
+        return false;
     }
 
     const bool ropeRequiredCandidate =
@@ -9397,13 +11491,9 @@ bool attackRuleShouldBlockWeaponInput(int key, LONG& weaponId, AttackBlockReason
         && !ropeContext
         && selectedWeaponRequiresRopeToAttack(weaponId);
 
-    if (key == VK_SPACE && ropeContext) {
-        return false;
-    }
-
     if (prerequisiteReason != AttackBlockReason::None) {
         reason = prerequisiteReason;
-        return !selectedWeaponBypassesAttackRequirements(weaponId);
+        return true;
     }
 
     if (ropeRequiredCandidate) {
@@ -9468,6 +11558,12 @@ bool consumeBlockedWeaponWindowInput(MSG& message, const char* source, UINT peek
         return false;
     }
 
+    if (!attackRulesApplyToCurrentMap()) {
+        InterlockedExchange(&g_blockedWeaponInputKeyMask, 0);
+        InterlockedExchange(&g_blockedWeaponInputSuppressUntilTick, 0);
+        return false;
+    }
+
     if (source != nullptr
         && std::strcmp(source, "PeekMessageA") == 0
         && (peekRemoveMessage & PM_REMOVE) == 0) {
@@ -9509,6 +11605,9 @@ bool consumeBlockedWeaponWindowInput(MSG& message, const char* source, UINT peek
 
     if (keyMask != 0) {
         InterlockedOr(&g_blockedWeaponInputKeyMask, keyMask);
+        InterlockedExchange(
+            &g_blockedWeaponInputSuppressUntilTick,
+            static_cast<LONG>(GetTickCount() + 350));
     }
 
     logBlockedWeaponInput(message, source, weaponId, attackBlockReasonName(blockReason));
@@ -9782,6 +11881,7 @@ BOOL WINAPI hookedGetMessageA(LPMSG message, HWND window, UINT messageFilterMin,
         consumeBlockedWeaponWindowInput(*message, "GetMessageA", 0);
         updateChatOverlayStateFromWindowMessage(*message);
     }
+    checkOnlineLobbyCompatibilityTimeout();
 
     return result;
 }
@@ -9801,6 +11901,51 @@ BOOL WINAPI hookedPeekMessageA(LPMSG message, HWND window, UINT messageFilterMin
     if (result && message != nullptr) {
         consumeBlockedWeaponWindowInput(*message, "PeekMessageA", removeMessage);
         updateChatOverlayStateFromWindowMessage(*message);
+    }
+    checkOnlineLobbyCompatibilityTimeout();
+
+    return result;
+}
+
+SHORT WINAPI hookedGetAsyncKeyState(int virtualKey) noexcept {
+    if (g_originalGetAsyncKeyState == nullptr) {
+        return 0;
+    }
+
+    const SHORT result = g_originalGetAsyncKeyState(virtualKey);
+    if (blockedWeaponInputKeyStateSuppressed(virtualKey)) {
+        return 0;
+    }
+
+    return result;
+}
+
+SHORT WINAPI hookedGetKeyState(int virtualKey) noexcept {
+    if (g_originalGetKeyState == nullptr) {
+        return 0;
+    }
+
+    const SHORT result = g_originalGetKeyState(virtualKey);
+    if (blockedWeaponInputKeyStateSuppressed(virtualKey)) {
+        return static_cast<SHORT>(result & 0x0001);
+    }
+
+    return result;
+}
+
+BOOL WINAPI hookedGetKeyboardState(PBYTE keyState) noexcept {
+    if (g_originalGetKeyboardState == nullptr) {
+        return FALSE;
+    }
+
+    const BOOL result = g_originalGetKeyboardState(keyState);
+    if (result && keyState != nullptr) {
+        if (blockedWeaponInputKeyStateSuppressed(VK_SPACE)) {
+            keyState[VK_SPACE] = static_cast<BYTE>(keyState[VK_SPACE] & 0x01);
+        }
+        if (blockedWeaponInputKeyStateSuppressed(VK_RETURN)) {
+            keyState[VK_RETURN] = static_cast<BYTE>(keyState[VK_RETURN] & 0x01);
+        }
     }
 
     return result;
@@ -10122,10 +12267,13 @@ FARPROC WINAPI hookedGetProcAddress(HMODULE module, LPCSTR procName) {
     }
 
     if (g_direct3D9ProbeEnabled && proc != nullptr && isNamedProc(procName, "Direct3DCreate9")) {
-        g_originalDirect3DCreate9 = reinterpret_cast<Direct3DCreate9Function>(proc);
+        if (g_direct3DCreate9ExportTarget == 0
+            || reinterpret_cast<std::uintptr_t>(proc) != g_direct3DCreate9ExportTarget) {
+            g_originalDirect3DCreate9 = reinterpret_cast<Direct3DCreate9Function>(proc);
+        }
         InterlockedExchange(&g_direct3D9ProbeHits, 0);
         InterlockedExchange(&g_direct3D9CreateDeviceProbeHits, 0);
-        if (g_runtimeProbeLogger != nullptr) {
+        if (kVerboseRuntimeDiagnostics && g_runtimeProbeLogger != nullptr) {
             std::ostringstream message;
             message << "runtime probe: replacing GetProcAddress Direct3DCreate9 result with detour "
                     << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedDirect3DCreate9));
@@ -10170,6 +12318,91 @@ FARPROC WINAPI hookedGetProcAddress(HMODULE module, LPCSTR procName) {
     }
 
     return proc;
+}
+
+bool installLoadedDirect3D9CreateHook(Logger& logger, X86DetourHook& hook) {
+    if (!g_direct3D9ProbeEnabled || hook.installed()) {
+        return true;
+    }
+
+    HMODULE direct3D9Module = GetModuleHandleA("d3d9.dll");
+    if (direct3D9Module == nullptr) {
+        return true;
+    }
+
+    FARPROC createProc = g_originalGetProcAddress != nullptr
+        ? g_originalGetProcAddress(direct3D9Module, "Direct3DCreate9")
+        : GetProcAddress(direct3D9Module, "Direct3DCreate9");
+    if (createProc == nullptr) {
+        return true;
+    }
+
+    std::string hookError;
+    if (!hook.install(reinterpret_cast<void*>(createProc), reinterpret_cast<void*>(&hookedDirect3DCreate9), 5, hookError)) {
+        logger.warn("runtime probe: failed to install d3d9!Direct3DCreate9 export hook: " + hookError);
+        return false;
+    }
+
+    g_direct3DCreate9ExportTarget = reinterpret_cast<std::uintptr_t>(createProc);
+    g_originalDirect3DCreate9 = reinterpret_cast<Direct3DCreate9Function>(hook.trampoline());
+    InterlockedExchange(&g_direct3D9ProbeHits, 0);
+    InterlockedExchange(&g_direct3D9CreateDeviceProbeHits, 0);
+
+    std::ostringstream message;
+    message << "runtime probe: d3d9!Direct3DCreate9 export hook installed at "
+            << formatAddress(g_direct3DCreate9ExportTarget)
+            << ", trampoline "
+            << formatAddress(reinterpret_cast<std::uintptr_t>(hook.trampoline()));
+    logger.info(message.str());
+    return true;
+}
+
+bool installRendererApiProbeHooks(
+    Logger& logger,
+    IatHook& loadLibraryAHook,
+    IatHook& getProcAddressHook,
+    X86DetourHook& direct3DCreate9ExportHook,
+    std::string& error) {
+    InterlockedExchange(&g_rendererApiProbeLoadHits, 0);
+    InterlockedExchange(&g_rendererApiProbeProcHits, 0);
+
+    void* originalLoadLibraryA = nullptr;
+    if (!loadLibraryAHook.install("KERNEL32.dll", "LoadLibraryA", reinterpret_cast<void*>(&hookedLoadLibraryA), originalLoadLibraryA, error)) {
+        logger.warn("runtime probe: failed to install KERNEL32!LoadLibraryA IAT hook: " + error);
+    } else {
+        g_originalLoadLibraryA = reinterpret_cast<LoadLibraryAFunction>(originalLoadLibraryA);
+
+        std::ostringstream hookMessage;
+        hookMessage << "runtime probe: KERNEL32!LoadLibraryA IAT hook installed; original "
+                    << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalLoadLibraryA))
+                    << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedLoadLibraryA));
+        logger.info(hookMessage.str());
+    }
+
+    void* originalGetProcAddress = nullptr;
+    if (!getProcAddressHook.install("KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(&hookedGetProcAddress), originalGetProcAddress, error)) {
+        logger.warn("runtime probe: failed to install KERNEL32!GetProcAddress IAT hook: " + error);
+    } else {
+        g_originalGetProcAddress = reinterpret_cast<GetProcAddressFunction>(originalGetProcAddress);
+
+        std::ostringstream hookMessage;
+        hookMessage << "runtime probe: KERNEL32!GetProcAddress IAT hook installed; original "
+                    << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalGetProcAddress))
+                    << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedGetProcAddress));
+        logger.info(hookMessage.str());
+    }
+
+    if (!loadLibraryAHook.installed() && !getProcAddressHook.installed()) {
+        error = "failed to install every renderer API runtime probe hook";
+        logger.warn("runtime probe: " + error);
+        return false;
+    }
+
+    if (!installLoadedDirect3D9CreateHook(logger, direct3DCreate9ExportHook)) {
+        logger.warn("runtime probe: d3d9 export hook was not installed; waiting for GetProcAddress fallback");
+    }
+
+    return true;
 }
 }
 
@@ -10424,6 +12657,213 @@ bool IatHook::installed() const {
     return installed_;
 }
 
+void releaseProbeStub(void*& stub) {
+    if (stub == nullptr) {
+        return;
+    }
+
+    VirtualFree(stub, 0, MEM_RELEASE);
+    stub = nullptr;
+}
+
+bool WaHookManager::ensureGameplayHooks(Logger& logger, const char* reason) {
+    if (!initialized_ || !gameplayHookSupportEnabled_) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_gameplayHookLifecycleMutex);
+    if (cameraTrackingHook_.installed()
+        && cameraRenderCopyHook_.installed()
+        && cameraTargetAggregateHook_.installed()
+        && wormMotionCandidateHook_.installed()
+        && movementCollisionResultHook_.installed()
+        && movementCollisionPathHook_.installed()
+        && movementCollisionBranchHook_.installed()
+        && collisionQueryCommonHook_.installed()
+        && movementResolutionSecondaryResultHook_.installed()
+        && jumpTerrainCollisionResultHook_.installed()) {
+        return true;
+    }
+
+    ProcessModuleView module{};
+    module.base = moduleBase_;
+    module.size = moduleSize_;
+    if (!module) {
+        logger.warn("runtime probe: cannot enable gameplay hooks without a valid W:A module view");
+        return false;
+    }
+
+    bool installedAny = false;
+    std::string hookError;
+    auto warn = [&](const char* hookName, const std::string& error) {
+        logger.warn(std::string("runtime probe: failed to enable ") + hookName + " hook on demand: " + error);
+    };
+
+    if (!cameraTrackingHook_.installed()) {
+        hookError.clear();
+        if (installWaCameraTrackingProbe(logger, module, cameraTrackingHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A camera tracking", hookError);
+        }
+    }
+
+    if (!cameraRenderCopyHook_.installed()) {
+        hookError.clear();
+        if (installWaCameraRenderCopyProbe(logger, module, cameraRenderCopyHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A camera render copy", hookError);
+        }
+    }
+
+    if (!cameraTargetAggregateHook_.installed()) {
+        hookError.clear();
+        if (installWaCameraTargetAggregateProbe(logger, module, cameraTargetAggregateHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A camera target aggregate", hookError);
+        }
+    }
+
+    if (!wormMotionCandidateHook_.installed()) {
+        hookError.clear();
+        if (installWaWormMotionCandidateProbe(logger, module, wormMotionCandidateHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A worm motion candidate", hookError);
+        }
+    }
+
+    if (!movementCollisionResultHook_.installed()) {
+        hookError.clear();
+        if (installWaMovementCollisionResultProbe(logger, module, movementCollisionResultHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A movement collision result", hookError);
+        }
+    }
+
+    if (!movementCollisionPathHook_.installed()) {
+        hookError.clear();
+        if (installWaMovementCollisionPathProbe(logger, module, movementCollisionPathHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A movement collision path", hookError);
+        }
+    }
+
+    if (!movementCollisionBranchHook_.installed()) {
+        hookError.clear();
+        if (installWaMovementCollisionBranchProbe(logger, module, movementCollisionBranchHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A movement collision branch", hookError);
+        }
+    }
+
+    if (!collisionQueryCommonHook_.installed()) {
+        hookError.clear();
+        if (installWaCollisionQueryCommonProbe(logger, module, collisionQueryCommonHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A collision query common", hookError);
+        }
+    }
+
+    if (!movementResolutionSecondaryResultHook_.installed()) {
+        hookError.clear();
+        if (installWaMovementResolutionResultProbe(
+                logger,
+                module,
+                movementResolutionSecondaryResultHook_,
+                kWa381MovementResolutionSecondaryResultRva,
+                0x17,
+                {0x85, 0xC0, 0x74, 0x13, 0x8B, 0x4C, 0x24, 0x1C},
+                {0x8B, 0x4C, 0x24, 0x1C},
+                g_movementResolutionSecondaryResultProbeStub,
+                "movement resolution secondary result",
+                hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A movement resolution secondary result", hookError);
+        }
+    }
+
+    if (!jumpTerrainCollisionResultHook_.installed()) {
+        hookError.clear();
+        if (installWaJumpTerrainCollisionResultProbe(logger, module, jumpTerrainCollisionResultHook_, hookError)) {
+            installedAny = true;
+        } else {
+            warn("W:A jump terrain collision result", hookError);
+        }
+    }
+
+    if (installedAny) {
+        std::ostringstream message;
+        message << "runtime probe: gameplay hook group enabled";
+        if (reason != nullptr && reason[0] != '\0') {
+            message << " (" << reason << ")";
+        }
+        logger.info(message.str());
+    }
+
+    return cameraTrackingHook_.installed()
+        || cameraRenderCopyHook_.installed()
+        || cameraTargetAggregateHook_.installed()
+        || wormMotionCandidateHook_.installed()
+        || movementCollisionResultHook_.installed()
+        || movementCollisionPathHook_.installed()
+        || movementCollisionBranchHook_.installed()
+        || collisionQueryCommonHook_.installed()
+        || movementResolutionSecondaryResultHook_.installed()
+        || jumpTerrainCollisionResultHook_.installed();
+}
+
+void WaHookManager::disableGameplayHooks(Logger& logger, const char* reason) {
+    std::lock_guard<std::mutex> lock(g_gameplayHookLifecycleMutex);
+
+    bool uninstalledAny = false;
+    std::string hookError;
+    auto uninstall = [&](const char* hookName, X86DetourHook& hook, void*& stub) {
+        if (!hook.installed()) {
+            releaseProbeStub(stub);
+            return;
+        }
+
+        hookError.clear();
+        if (!hook.uninstall(hookError)) {
+            logger.warn(std::string("runtime probe: failed to disable ") + hookName + " hook: " + hookError);
+            return;
+        }
+
+        releaseProbeStub(stub);
+        uninstalledAny = true;
+    };
+
+    uninstall("W:A jump terrain collision result", jumpTerrainCollisionResultHook_, g_jumpTerrainCollisionResultProbeStub);
+    uninstall("W:A movement resolution secondary result", movementResolutionSecondaryResultHook_, g_movementResolutionSecondaryResultProbeStub);
+    uninstall("W:A collision query common", collisionQueryCommonHook_, g_collisionQueryCommonProbeStub);
+    uninstall("W:A movement collision branch", movementCollisionBranchHook_, g_movementCollisionBranchProbeStub);
+    uninstall("W:A movement collision path", movementCollisionPathHook_, g_movementCollisionPathProbeStub);
+    uninstall("W:A movement collision result", movementCollisionResultHook_, g_movementCollisionResultProbeStub);
+    uninstall("W:A worm motion candidate", wormMotionCandidateHook_, g_wormMotionCandidateProbeStub);
+    uninstall("W:A camera target aggregate", cameraTargetAggregateHook_, g_cameraTargetAggregateProbeStub);
+    uninstall("W:A camera render copy", cameraRenderCopyHook_, g_cameraRenderCopyProbeStub);
+    uninstall("W:A camera tracking", cameraTrackingHook_, g_cameraTrackingProbeStub);
+
+    if (!uninstalledAny) {
+        return;
+    }
+
+    std::ostringstream message;
+    message << "runtime probe: gameplay hook group disabled";
+    if (reason != nullptr && reason[0] != '\0') {
+        message << " (" << reason << ")";
+    }
+    logger.info(message.str());
+}
+
 bool WaHookManager::initialize(
     Logger& logger,
     bool probeOnly,
@@ -10439,6 +12879,8 @@ bool WaHookManager::initialize(
     const std::vector<WaOverlayMap>& direct3D9OverlayMaps,
     const WaOverlayTransform& direct3D9OverlayTransform,
     const WaSoundConfig& soundConfig,
+    bool enableOnlineSync,
+    bool requireAllPlayersOnline,
     std::string& error) {
     error.clear();
 
@@ -10505,16 +12947,23 @@ bool WaHookManager::initialize(
         && !enableRendererApiProbe
         && !enableCameraProbe
         && !enableDirect3D9Probe
-        && !enableMetadataOverlayHooks) {
+        && !enableMetadataOverlayHooks
+        && !enableOnlineSync) {
         logger.info("hook runtime mode enabled, but no runtime probe hook is enabled in configuration");
         initialized_ = true;
         return true;
     }
 
     g_runtimeProbeLogger = &logger;
+    moduleBase_ = module.base;
+    moduleSize_ = module.size;
+    gameplayHookSupportEnabled_ = enableCameraProbe;
+    g_activeHookManager = this;
     g_direct3D9ProbeEnabled = enableDirect3D9Probe;
     g_direct3D9DeviceSlotProbeEnabled = enableDirect3D9DeviceSlotProbe;
     g_direct3D9OverlaySmokeTestEnabled = enableDirect3D9OverlaySmokeTest;
+    g_onlineSyncEnabled = enableOnlineSync;
+    g_onlineRequireAllPlayers = requireAllPlayersOnline;
     g_direct3D9OverlayTransform = direct3D9OverlayTransform;
     g_soundConfig = soundConfig;
     g_direct3D9OverlayMaps = direct3D9OverlayMaps;
@@ -10543,7 +12992,9 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_peekMessageProbeHits, 0);
     InterlockedExchange(&g_weaponInputBlockLogCount, 0);
     InterlockedExchange(&g_blockedWeaponInputKeyMask, 0);
+    InterlockedExchange(&g_blockedWeaponInputSuppressUntilTick, 0);
     InterlockedExchange(&g_utilityActionSelectionGraceUntilTick, 0);
+    InterlockedExchange(&g_recentRopeContextTick, 0);
     InterlockedExchange(&g_wallSoundLogCount, 0);
     InterlockedExchange(&g_wallSoundMissingLogCount, 0);
     InterlockedExchange(&g_wallWarningSoundLastTick, 0);
@@ -10604,6 +13055,10 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_direct3D9MetadataOverlayLastCameraDeltaY, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayLastCameraDeltaValid, 0);
     InterlockedExchange(&g_direct3D9MetadataOverlayCameraDeltaLogCount, 0);
+    g_direct3DCreate9ExportTarget = 0;
+    g_originalLoadLibraryA = nullptr;
+    g_originalGetProcAddress = nullptr;
+    g_originalDirect3DCreate9 = nullptr;
     InterlockedExchange(&g_direct3D9WallTouchLogCount, 0);
     InterlockedExchange(&g_wallTouchTurnOwnerAddress, 0);
     InterlockedExchange(&g_wallTouchResetLogCount, 0);
@@ -10618,7 +13073,34 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_turnGameHandleMessageProbeHits, 0);
     InterlockedExchange(&g_turnGameHandleMessageLogCount, 0);
     InterlockedExchange(&g_turnGameFinishTurnLastResetTick, 0);
+    resetWallGameplayTaskActivity();
     g_originalWaTurnGameHandleMessage = nullptr;
+    resetOnlineMetadataTransportState();
+    InterlockedExchange(&g_onlineMetadataSendLogCount, 0);
+    InterlockedExchange(&g_onlineMetadataReceiveLogCount, 0);
+    InterlockedExchange(&g_onlineMetadataErrorLogCount, 0);
+    InterlockedExchange(&g_onlineLobbyHookLogCount, 0);
+    InterlockedExchange(&g_onlineLobbyPacketLogCount, 0);
+    InterlockedExchange(&g_onlineLobbyMessageLogCount, 0);
+    InterlockedExchange(&g_onlineLobbyLastBroadcastTick, 0);
+    InterlockedExchange(&g_onlineLobbySeenSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyCompatibleSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyBroadcastSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyQuerySlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyLastConnectedSlotMask, 0);
+    InterlockedExchange(&g_onlineLobbyCompatibilityDeadlineTick, 0);
+    InterlockedExchange(&g_onlineLobbyCompatibilityReported, 0);
+    g_lobbyHostScreenAddress = 0;
+    g_lobbyClientScreenAddress = 0;
+    g_lobbyHostSlotAddress = 0;
+    g_lobbyClientSlotAddress = 0;
+    g_lobbyHostUnicastAddress = 0;
+    g_lobbyHostIncomingConnectionAddress = 0;
+    g_waLobbyDisplayMessage = nullptr;
+    g_originalWaHostLobbyPacketHandler = nullptr;
+    g_originalWaClientLobbyPacketHandler = nullptr;
+    g_originalWaConstructLobbyHostScreen = nullptr;
+    g_originalWaConstructLobbyClientScreen = nullptr;
     InterlockedExchange(&g_detectedMapSequence, 0);
     InterlockedExchange(&g_consumedMapSequence, 0);
     InterlockedExchange(&g_detectedMapTick, 0);
@@ -10634,6 +13116,7 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_direct3D9OverlayGameplayActive, 0);
     InterlockedExchange(&g_direct3D9OverlayLastGameplayEvidenceTick, 0);
     InterlockedExchange(&g_direct3D9OverlayGameplayLogCount, 0);
+    resetWallGameplayTaskActivity();
     {
         std::lock_guard<std::mutex> lock(g_directDrawProbeMutex);
         g_directDrawObjectVtableHooks.clear();
@@ -10661,6 +13144,18 @@ bool WaHookManager::initialize(
         error = "Direct3D9 overlay smoke test requires EnableDirect3D9DeviceSlotProbe=1";
         logger.warn("runtime probe: " + error);
         return false;
+    }
+
+    if (enableRendererApiProbe) {
+        if (!installRendererApiProbeHooks(
+                logger,
+                loadLibraryAHook_,
+                getProcAddressHook_,
+                direct3DCreate9ExportHook_,
+                error)) {
+            g_runtimeProbeLogger = nullptr;
+            return false;
+        }
     }
 
     if (!g_direct3D9OverlayMaps.empty()) {
@@ -10704,57 +13199,20 @@ bool WaHookManager::initialize(
         }
     }
 
-    if (enableCameraProbe) {
-        std::string cameraError;
-        if (!installWaCameraTrackingProbe(logger, module, cameraTrackingHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A camera tracking hook: " + cameraError);
-        }
-
-        if (!installWaCameraRenderCopyProbe(logger, module, cameraRenderCopyHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A camera render copy hook: " + cameraError);
-        }
-
-        if (!installWaCameraTargetAggregateProbe(logger, module, cameraTargetAggregateHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A camera target aggregate hook: " + cameraError);
-        }
-
-        if (!installWaWormMotionCandidateProbe(logger, module, wormMotionCandidateHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A worm motion candidate hook: " + cameraError);
-        }
-
-        if (!installWaMovementCollisionResultProbe(logger, module, movementCollisionResultHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A movement collision result hook: " + cameraError);
-        }
-
-        if (!installWaMovementCollisionPathProbe(logger, module, movementCollisionPathHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A movement collision path hook: " + cameraError);
-        }
-
-        if (!installWaMovementCollisionBranchProbe(logger, module, movementCollisionBranchHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A movement collision branch hook: " + cameraError);
-        }
-
-        if (!installWaCollisionQueryCommonProbe(logger, module, collisionQueryCommonHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A collision query common hook: " + cameraError);
-        }
-
-        if (!installWaMovementResolutionResultProbe(
+    if (enableOnlineSync) {
+        if (!installWaOnlineLobbySyncHooks(
                 logger,
                 module,
-                movementResolutionSecondaryResultHook_,
-                kWa381MovementResolutionSecondaryResultRva,
-                0x17,
-                {0x85, 0xC0, 0x74, 0x13, 0x8B, 0x4C, 0x24, 0x1C},
-                {0x8B, 0x4C, 0x24, 0x1C},
-                g_movementResolutionSecondaryResultProbeStub,
-                "movement resolution secondary result",
-                cameraError)) {
-            logger.warn("runtime probe: failed to install W:A movement resolution secondary result hook: " + cameraError);
+                hostLobbyPacketHandlerHook_,
+                clientLobbyPacketHandlerHook_,
+                constructLobbyHostScreenHook_,
+                constructLobbyClientScreenHook_)) {
+            logger.warn("online lobby sync: no lobby hook was installed; online metadata sync will stay inactive");
         }
+    }
 
-        if (!installWaJumpTerrainCollisionResultProbe(logger, module, jumpTerrainCollisionResultHook_, cameraError)) {
-            logger.warn("runtime probe: failed to install W:A jump terrain collision result hook: " + cameraError);
-        }
+    if (enableCameraProbe) {
+        logger.info("runtime probe: W:A gameplay hooks will be enabled on demand for active wall metadata maps");
     }
 
     if (enableMessagePumpProbe || enableMetadataOverlayHooks) {
@@ -10790,43 +13248,44 @@ bool WaHookManager::initialize(
             logger.warn("runtime probe: " + error);
             return false;
         }
-    }
 
-    if (enableRendererApiProbe) {
-        InterlockedExchange(&g_rendererApiProbeLoadHits, 0);
-        InterlockedExchange(&g_rendererApiProbeProcHits, 0);
-
-        void* originalLoadLibraryA = nullptr;
-        if (!loadLibraryAHook_.install("KERNEL32.dll", "LoadLibraryA", reinterpret_cast<void*>(&hookedLoadLibraryA), originalLoadLibraryA, error)) {
-            logger.warn("runtime probe: failed to install KERNEL32!LoadLibraryA IAT hook: " + error);
+        void* originalGetAsyncKeyState = nullptr;
+        if (!getAsyncKeyStateHook_.install("USER32.dll", "GetAsyncKeyState", reinterpret_cast<void*>(&hookedGetAsyncKeyState), originalGetAsyncKeyState, error)) {
+            logger.warn("runtime probe: failed to install USER32!GetAsyncKeyState IAT hook: " + error);
         } else {
-            g_originalLoadLibraryA = reinterpret_cast<LoadLibraryAFunction>(originalLoadLibraryA);
+            g_originalGetAsyncKeyState = reinterpret_cast<GetAsyncKeyStateFunction>(originalGetAsyncKeyState);
 
             std::ostringstream hookMessage;
-            hookMessage << "runtime probe: KERNEL32!LoadLibraryA IAT hook installed; original "
-                        << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalLoadLibraryA))
-                        << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedLoadLibraryA));
+            hookMessage << "runtime probe: USER32!GetAsyncKeyState IAT hook installed; original "
+                        << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalGetAsyncKeyState))
+                        << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedGetAsyncKeyState));
             logger.info(hookMessage.str());
         }
 
-        void* originalGetProcAddress = nullptr;
-        if (!getProcAddressHook_.install("KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(&hookedGetProcAddress), originalGetProcAddress, error)) {
-            logger.warn("runtime probe: failed to install KERNEL32!GetProcAddress IAT hook: " + error);
+        void* originalGetKeyState = nullptr;
+        if (!getKeyStateHook_.install("USER32.dll", "GetKeyState", reinterpret_cast<void*>(&hookedGetKeyState), originalGetKeyState, error)) {
+            logger.warn("runtime probe: failed to install USER32!GetKeyState IAT hook: " + error);
         } else {
-            g_originalGetProcAddress = reinterpret_cast<GetProcAddressFunction>(originalGetProcAddress);
+            g_originalGetKeyState = reinterpret_cast<GetKeyStateFunction>(originalGetKeyState);
 
             std::ostringstream hookMessage;
-            hookMessage << "runtime probe: KERNEL32!GetProcAddress IAT hook installed; original "
-                        << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalGetProcAddress))
-                        << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedGetProcAddress));
+            hookMessage << "runtime probe: USER32!GetKeyState IAT hook installed; original "
+                        << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalGetKeyState))
+                        << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedGetKeyState));
             logger.info(hookMessage.str());
         }
 
-        if (!loadLibraryAHook_.installed() && !getProcAddressHook_.installed()) {
-            g_runtimeProbeLogger = nullptr;
-            error = "failed to install every renderer API runtime probe hook";
-            logger.warn("runtime probe: " + error);
-            return false;
+        void* originalGetKeyboardState = nullptr;
+        if (!getKeyboardStateHook_.install("USER32.dll", "GetKeyboardState", reinterpret_cast<void*>(&hookedGetKeyboardState), originalGetKeyboardState, error)) {
+            logger.warn("runtime probe: failed to install USER32!GetKeyboardState IAT hook: " + error);
+        } else {
+            g_originalGetKeyboardState = reinterpret_cast<GetKeyboardStateFunction>(originalGetKeyboardState);
+
+            std::ostringstream hookMessage;
+            hookMessage << "runtime probe: USER32!GetKeyboardState IAT hook installed; original "
+                        << formatAddress(reinterpret_cast<std::uintptr_t>(g_originalGetKeyboardState))
+                        << ", detour " << formatAddress(reinterpret_cast<std::uintptr_t>(&hookedGetKeyboardState));
+            logger.info(hookMessage.str());
         }
     }
 

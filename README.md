@@ -25,7 +25,6 @@ Current alpha build supports:
 
 Known limitations:
 
-- wall touch detection is much more reliable than early tracking builds, but rare missed touches may still happen
 - OpenGL does not currently provide the same smooth highlight path as Direct3D 9 and may be less polished
 - online synchronization is not ready for normal public games
 - if one player does not have the module in an online match, the current alpha build does not yet provide the final compatibility handshake
