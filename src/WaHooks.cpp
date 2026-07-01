@@ -1351,7 +1351,7 @@ bool tryReadLong(std::uintptr_t address, LONG& value) {
     return true;
 }
 
-void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize);
+bool handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize);
 
 std::uint16_t readLittleEndian16(const std::uint8_t* data) {
     return static_cast<std::uint16_t>(data[0])
@@ -1656,6 +1656,37 @@ std::string describeWallLobbyVersionInfo(const std::uint8_t* payload, std::size_
             << readLittleEndian16(payload)
             << ", transport "
             << readLittleEndian16(payload + 2);
+    return message.str();
+}
+
+std::string describeWallLobbyVersionMismatch(
+    std::uint16_t protocolVersion,
+    const std::uint8_t* payload,
+    std::size_t payloadSize) {
+    std::ostringstream message;
+    message << "incompatible";
+    if (payload != nullptr && payloadSize >= 4) {
+        message << ": " << describeWallLobbyVersionInfo(payload, payloadSize);
+    }
+    if (protocolVersion != kWallProtocolVersion) {
+        message << ", lobby header protocol " << protocolVersion;
+    }
+    return message.str();
+}
+
+std::string describeWallLobbyVersionForLog(
+    std::uint16_t protocolVersion,
+    const std::uint8_t* payload,
+    std::size_t payloadSize) {
+    std::ostringstream message;
+    if (payload != nullptr && payloadSize >= 4) {
+        message << describeWallLobbyVersionInfo(payload, payloadSize);
+    } else {
+        message << "invalid version payload";
+    }
+    if (protocolVersion != kWallProtocolVersion) {
+        message << " (lobby header protocol " << protocolVersion << ")";
+    }
     return message.str();
 }
 
@@ -2299,18 +2330,16 @@ void handleWallLobbyPacketAsHost(
 
         std::ostringstream message;
         message << onlineLobbySlotName(slot)
-                << " has wkWall2Wall "
-                << describeWallLobbyVersionInfo(payload, payloadSize);
+                << " has wkWall2Wall";
         if (!compatible) {
-            message << " (incompatible)";
-        }
-        if (protocolVersion != kWallProtocolVersion) {
-            message << " (lobby header protocol " << protocolVersion << ")";
+            message << " (" << describeWallLobbyVersionMismatch(protocolVersion, payload, payloadSize) << ")";
         }
         wallLobbyPrint(message.str());
         if (g_runtimeProbeLogger != nullptr && g_onlineLobbyPacketLogCount < 48) {
             InterlockedIncrement(&g_onlineLobbyPacketLogCount);
-            g_runtimeProbeLogger->info("online lobby sync: " + message.str());
+            g_runtimeProbeLogger->info(
+                "online lobby sync: " + message.str()
+                + " [" + describeWallLobbyVersionForLog(protocolVersion, payload, payloadSize) + "]");
         }
         if (compatible && hasQueuedOnlineMetadataFrames()) {
             std::vector<std::vector<std::uint8_t>> frames;
@@ -2369,12 +2398,14 @@ void handleWallLobbyPacketAsClient(
     }
 
     if (messageType == kWallLobbyMessageMetadataFrame) {
-        handleIncomingOnlineMetadataFrame(payload, payloadSize);
+        if (handleIncomingOnlineMetadataFrame(payload, payloadSize)) {
+            wallLobbyPrint("walls metadata received, ready to play!");
+        }
         return;
     }
 
     if (messageType == kWallLobbyMessageVersionInfo) {
-        wallLobbyPrint("host has wkWall2Wall " + describeWallLobbyVersionInfo(payload, payloadSize));
+        wallLobbyPrint("host has wkWall2Wall.");
     }
 }
 
@@ -8435,9 +8466,9 @@ void activateDirect3D9OverlayMap(std::size_t mapIndex, const std::string& detect
     }
 }
 
-void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
+bool handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
     if (!g_onlineSyncEnabled || data == nullptr || dataSize == 0) {
-        return;
+        return false;
     }
 
     WallTransportFrame frame;
@@ -8451,7 +8482,7 @@ void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
             InterlockedIncrement(&g_onlineMetadataErrorLogCount);
             g_runtimeProbeLogger->warn("online sync: rejected incoming metadata frame: " + error);
         }
-        return;
+        return false;
     }
 
     bool completed = false;
@@ -8464,7 +8495,7 @@ void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
                 InterlockedIncrement(&g_onlineMetadataErrorLogCount);
                 g_runtimeProbeLogger->warn("online sync: failed to accept incoming metadata frame: " + error);
             }
-            return;
+            return false;
         }
 
         completed = g_onlineIncomingMetadata.complete();
@@ -8486,7 +8517,7 @@ void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
                     << frame.transferId;
             g_runtimeProbeLogger->info(message.str());
         }
-        return;
+        return false;
     }
 
     WallMapMetadata metadata;
@@ -8495,7 +8526,7 @@ void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
             InterlockedIncrement(&g_onlineMetadataErrorLogCount);
             g_runtimeProbeLogger->warn("online sync: failed to deserialize host metadata: " + error);
         }
-        return;
+        return false;
     }
 
     std::size_t mapIndex = 0;
@@ -8504,7 +8535,7 @@ void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
             InterlockedIncrement(&g_onlineMetadataErrorLogCount);
             g_runtimeProbeLogger->warn("online sync: host metadata had no valid walls");
         }
-        return;
+        return false;
     }
 
     activateDirect3D9OverlayMap(mapIndex, metadata.fileName, false);
@@ -8520,6 +8551,8 @@ void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
                 << " wall(s)";
         g_runtimeProbeLogger->info(message.str());
     }
+
+    return true;
 }
 
 void refreshDetectedMapCacheForActiveOverlay() {

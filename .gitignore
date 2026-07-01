@@ -11,6 +11,7 @@ tools/reverse/
 tools/__pycache__/
 *.log
 *.dll
+!release/*.dll
 *.exe
 *.lib
 *.pdb
