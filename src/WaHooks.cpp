@@ -736,7 +736,6 @@ volatile LONG g_chatOverlayControlKeyActive = 0;
 volatile LONG g_chatOverlayPinnedMode = 0;
 volatile LONG g_chatOverlayPinnedPending = 0;
 volatile LONG g_chatOverlayPinnedActivationTick = 0;
-volatile LONG g_chatOverlayPinnedAutoProbeTick = 0;
 volatile LONG g_chatOverlayLastUnpinnedCameraYPixels = 0;
 volatile LONG g_chatOverlayPinnedCameraOffsetY = LONG_MIN;
 volatile LONG g_chatOverlayPinnedBaselineBaseY = LONG_MIN;
@@ -3367,7 +3366,6 @@ void resetTransientGameplayTrackingState(const char* reason, bool clearWormSampl
     resetCollisionDiagnosticLogWindows();
     InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
-    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
     if (resetWallCount != 0) {
         InterlockedExchange(&g_wallTouchLastResetTick, static_cast<LONG>(GetTickCount()));
     }
@@ -8329,24 +8327,6 @@ void queueOnlineMetadataBroadcastForMap(std::size_t mapIndex) {
     broadcastQueuedOnlineMetadataToLobby();
 }
 
-bool activeOverlayMapMatchesHostMetadata(const WallMapMetadata& metadata) {
-    const LONG activeIndex = g_direct3D9ActiveOverlayMapIndex;
-    if (activeIndex < 0 || static_cast<std::size_t>(activeIndex) >= g_direct3D9OverlayMaps.size()) {
-        return true;
-    }
-
-    const WaOverlayMap& active = g_direct3D9OverlayMaps[static_cast<std::size_t>(activeIndex)];
-    if (!active.sha256.empty() && !metadata.sha256.empty()) {
-        return sameAsciiText(active.sha256, metadata.sha256);
-    }
-
-    if (active.width > 0 && active.height > 0 && metadata.width > 0 && metadata.height > 0) {
-        return active.width == metadata.width && active.height == metadata.height;
-    }
-
-    return true;
-}
-
 bool addOrUpdateOnlineOverlayMap(const WallMapMetadata& metadata, std::size_t& mapIndex) {
     WaOverlayMap overlayMap = overlayMapFromWallMetadata(metadata);
     if (overlayMap.rects.empty()) {
@@ -8514,14 +8494,6 @@ void handleIncomingOnlineMetadataFrame(const void* data, std::size_t dataSize) {
         if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
             InterlockedIncrement(&g_onlineMetadataErrorLogCount);
             g_runtimeProbeLogger->warn("online sync: failed to deserialize host metadata: " + error);
-        }
-        return;
-    }
-
-    if (!activeOverlayMapMatchesHostMetadata(metadata)) {
-        if (g_runtimeProbeLogger != nullptr && g_onlineMetadataErrorLogCount < 16) {
-            InterlockedIncrement(&g_onlineMetadataErrorLogCount);
-            g_runtimeProbeLogger->warn("online sync: ignored host metadata because it does not match the active map");
         }
         return;
     }
@@ -11633,7 +11605,6 @@ void activateChatOverlayPinnedMode() {
     InterlockedExchange(&g_chatOverlayPinnedMode, 1);
     InterlockedExchange(&g_chatOverlayPinnedPending, 0);
     InterlockedExchange(&g_chatOverlayPinnedActivationTick, 0);
-    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
     InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayLastUnpinnedBaseY, LONG_MIN);
@@ -11647,7 +11618,6 @@ void scheduleChatOverlayPinnedActivation(DWORD delayMilliseconds) {
     InterlockedExchange(&g_chatOverlayActive, 0);
     InterlockedExchange(&g_chatOverlayPinnedMode, 0);
     InterlockedExchange(&g_chatOverlayPinnedPending, 1);
-    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
     InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayLastUnpinnedBaseY, LONG_MIN);
@@ -11683,7 +11653,6 @@ void resetChatOverlayState() {
     InterlockedExchange(&g_chatOverlayPinnedMode, 0);
     InterlockedExchange(&g_chatOverlayPinnedPending, 0);
     InterlockedExchange(&g_chatOverlayPinnedActivationTick, 0);
-    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
     InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayScanPendingTick, 0);
@@ -13014,7 +12983,6 @@ bool WaHookManager::initialize(
     InterlockedExchange(&g_chatOverlayPinnedMode, 0);
     InterlockedExchange(&g_chatOverlayPinnedPending, 0);
     InterlockedExchange(&g_chatOverlayPinnedActivationTick, 0);
-    InterlockedExchange(&g_chatOverlayPinnedAutoProbeTick, 0);
     InterlockedExchange(&g_chatOverlayLastUnpinnedCameraYPixels, 0);
     InterlockedExchange(&g_chatOverlayPinnedCameraOffsetY, LONG_MIN);
     InterlockedExchange(&g_chatOverlayPinnedBaselineBaseY, LONG_MIN);
